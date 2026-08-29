@@ -45,6 +45,8 @@ zentangler_effect_summary_row <- function(fit, prefix = "") {
       nde = NA_real_,
       nie_total = NA_real_,
       te = NA_real_,
+      reduced_total_effect = NA_real_,
+      p_reduced_total_effect = NA_real_,
       prop_mediated = NA_real_,
       stringsAsFactors = FALSE
     ))
@@ -55,6 +57,8 @@ zentangler_effect_summary_row <- function(fit, prefix = "") {
     nde = if ("nde" %in% names(eff)) suppressWarnings(as.numeric(eff$nde[[1L]])) else NA_real_,
     nie_total = if ("nie_total" %in% names(eff)) suppressWarnings(as.numeric(eff$nie_total[[1L]])) else NA_real_,
     te = if ("te" %in% names(eff)) suppressWarnings(as.numeric(eff$te[[1L]])) else NA_real_,
+    reduced_total_effect = if ("reduced_total_effect" %in% names(eff)) suppressWarnings(as.numeric(eff$reduced_total_effect[[1L]])) else NA_real_,
+    p_reduced_total_effect = if ("p_reduced_total_effect" %in% names(eff)) suppressWarnings(as.numeric(eff$p_reduced_total_effect[[1L]])) else NA_real_,
     prop_mediated = if ("prop_mediated" %in% names(eff)) suppressWarnings(as.numeric(eff$prop_mediated[[1L]])) else NA_real_,
     stringsAsFactors = FALSE
   )

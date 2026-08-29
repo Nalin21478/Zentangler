@@ -694,8 +694,8 @@ Important fit object fields:
 | `mediators_top` | top mediators by absolute score |
 | `view_summary` | per-view tested, screened, and active counts |
 | `model_summary` | one-row run summary |
-| `effects` | direct, indirect, and total-effect-style summaries |
-| `effect_decomposition` | direct, indirect, total-effect-style summaries |
+| `effects` | direct, indirect, total-effect-style summaries plus reduced `X -> Y` total-effect inference |
+| `effect_decomposition` | direct, indirect, total-effect-style summaries plus reduced `X -> Y` total-effect inference |
 | `bootstrap` | bootstrap matrices and failures, if enabled |
 | `fits` | fitted model objects if `return_fits = TRUE` |
 

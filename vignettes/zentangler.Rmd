@@ -669,6 +669,10 @@ the lower observed exposure level versus the higher observed exposure level. For
 continuous exposures, the default contrast is the 25th versus 75th percentile,
 unless `effect_x0` and `effect_x1` are supplied by the user.
 
+The same table also includes `reduced_total_effect`, which is the reduced
+`X -> Y` total-effect estimate, and `p_reduced_total_effect`, which reports the
+model-based significance of that reduced total-effect fit.
+
 For Gaussian outcomes, effects are reported on the mean-difference scale. For
 binary outcomes, effects are reported on the risk-difference scale by averaging
 predicted probabilities under the relevant counterfactual mediator values.

@@ -207,6 +207,8 @@ zentangler_compute_model_summary <- function(settings, diagnostics, tab, q_thres
     nde = effects$nde %||% NA_real_,
     nie_total = effects$nie_total %||% NA_real_,
     te = effects$te %||% NA_real_,
+    reduced_total_effect = effects$reduced_total_effect %||% NA_real_,
+    p_reduced_total_effect = effects$p_reduced_total_effect %||% NA_real_,
     prop_mediated = effects$prop_mediated %||% NA_real_,
     runtime_seconds = diagnostics$runtime_seconds %||% NA_real_,
     stringsAsFactors = FALSE
@@ -229,6 +231,8 @@ zentangler_interpret_effects <- function(fit, digits = 3L) {
   nde <- suppressWarnings(as.numeric(out$nde[[1L]] %||% NA_real_))
   nie <- suppressWarnings(as.numeric(out$nie_total[[1L]] %||% NA_real_))
   te <- suppressWarnings(as.numeric(out$te[[1L]] %||% NA_real_))
+  reduced_te <- suppressWarnings(as.numeric(out$reduced_total_effect[[1L]] %||% NA_real_))
+  p_reduced_te <- suppressWarnings(as.numeric(out$p_reduced_total_effect[[1L]] %||% NA_real_))
   prop <- suppressWarnings(as.numeric(out$prop_mediated[[1L]] %||% NA_real_))
 
   sign_label <- function(x) {
@@ -266,6 +270,8 @@ zentangler_interpret_effects <- function(fit, digits = 3L) {
     nde = round(nde, digits = digits),
     nie_total = round(nie, digits = digits),
     te = round(te, digits = digits),
+    reduced_total_effect = round(reduced_te, digits = digits),
+    p_reduced_total_effect = signif(p_reduced_te, digits = max(2L, digits)),
     prop_mediated = round(prop, digits = digits),
     nde_direction = sign_label(nde),
     nie_direction = sign_label(nie),

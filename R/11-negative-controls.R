@@ -87,6 +87,177 @@ zentangler_empirical_le <- function(null_vals, obs_val) {
   mean(null_vals[ok] <= obs_val)
 }
 
+zentangler_bind_nonempty_rows <- function(rows) {
+  keep <- vapply(rows, function(x) is.data.frame(x) && nrow(x) > 0L, logical(1))
+  if (!any(keep)) return(data.frame())
+  out <- do.call(rbind, rows[keep])
+  rownames(out) <- NULL
+  out
+}
+
+zentangler_make_parallel_mediator_stat_table <- function(
+  fit,
+  q_threshold = 0.25,
+  perm_id = 0L,
+  null_type = "observed",
+  fit_seed = NA_integer_,
+  permutation_seed = NA_integer_
+) {
+  tab <- zentangler_all_mediators(fit)
+  if (!is.data.frame(tab) || nrow(tab) == 0L) return(data.frame())
+  q <- zentangler_get_primary_q_values(tab)
+  if (length(q) == 0L) q <- rep(NA_real_, nrow(tab))
+  out <- data.frame(
+    perm_id = as.integer(perm_id),
+    null_type = as.character(null_type),
+    fit_seed = as.integer(fit_seed),
+    permutation_seed = as.integer(permutation_seed),
+    omics = as.character(tab$omics %||% rep(NA_character_, nrow(tab))),
+    mediator = as.character(tab$mediator %||% rep(NA_character_, nrow(tab))),
+    mediator_id = if (all(c("omics", "mediator") %in% names(tab))) paste(tab$omics, tab$mediator, sep = "::") else as.character(seq_len(nrow(tab))),
+    score = if ("score" %in% names(tab)) suppressWarnings(as.numeric(tab$score)) else NA_real_,
+    abs_score = if ("abs_score" %in% names(tab)) suppressWarnings(as.numeric(tab$abs_score)) else if ("score" %in% names(tab)) abs(suppressWarnings(as.numeric(tab$score))) else NA_real_,
+    p_primary = if ("p_primary" %in% names(tab)) suppressWarnings(as.numeric(tab$p_primary)) else NA_real_,
+    q_primary = q,
+    is_active = is.finite(q) & q <= q_threshold & is.finite(tab$b) & tab$b != 0,
+    stringsAsFactors = FALSE
+  )
+  rownames(out) <- NULL
+  out
+}
+
+zentangler_make_sequential_path_stat_table <- function(
+  fit,
+  q_threshold = 0.25,
+  perm_id = 0L,
+  null_type = "observed",
+  fit_seed = NA_integer_,
+  permutation_seed = NA_integer_
+) {
+  tab <- zentangler_sequential_paths(fit)
+  if (!is.data.frame(tab) || nrow(tab) == 0L) return(data.frame())
+  q <- zentangler_get_primary_q_values(tab)
+  if (length(q) == 0L) q <- rep(NA_real_, nrow(tab))
+  path_id <- if ("key_path" %in% names(tab)) {
+    as.character(tab$key_path)
+  } else if ("mediator_path" %in% names(tab)) {
+    as.character(tab$mediator_path)
+  } else {
+    as.character(seq_len(nrow(tab)))
+  }
+  out <- data.frame(
+    perm_id = as.integer(perm_id),
+    null_type = as.character(null_type),
+    fit_seed = as.integer(fit_seed),
+    permutation_seed = as.integer(permutation_seed),
+    path_id = path_id,
+    sequential_score = if ("sequential_score" %in% names(tab)) suppressWarnings(as.numeric(tab$sequential_score)) else NA_real_,
+    abs_sequential_score = if ("abs_sequential_score" %in% names(tab)) suppressWarnings(as.numeric(tab$abs_sequential_score)) else if ("sequential_score" %in% names(tab)) abs(suppressWarnings(as.numeric(tab$sequential_score))) else NA_real_,
+    p_primary = if ("p_primary" %in% names(tab)) suppressWarnings(as.numeric(tab$p_primary)) else NA_real_,
+    q_primary = q,
+    is_active = is.finite(q) & q <= q_threshold & is.finite(tab$b) & tab$b != 0,
+    stringsAsFactors = FALSE
+  )
+  rownames(out) <- NULL
+  out
+}
+
+zentangler_parallel_empirical_mediator_summary <- function(observed_stats, null_stats) {
+  if (!is.data.frame(observed_stats) || nrow(observed_stats) == 0L) return(data.frame())
+  if (!is.data.frame(null_stats) || nrow(null_stats) == 0L) {
+    out <- observed_stats
+    out$n_null <- 0L
+    out$n_null_active <- 0L
+    out$null_mean_abs_score <- NA_real_
+    out$null_max_abs_score <- NA_real_
+    out$null_selection_frequency <- NA_real_
+    out$empirical_p_is_active <- NA_real_
+    out$empirical_p_abs_score <- NA_real_
+    rownames(out) <- NULL
+    return(out)
+  }
+  null_split <- split(null_stats, null_stats$mediator_id)
+  rows <- lapply(seq_len(nrow(observed_stats)), function(ii) {
+    obs <- observed_stats[ii, , drop = FALSE]
+    nn <- null_split[[as.character(obs$mediator_id[[1L]])]]
+    if (is.null(nn) || nrow(nn) == 0L) {
+      obs$n_null <- 0L
+      obs$n_null_active <- 0L
+      obs$null_mean_abs_score <- NA_real_
+      obs$null_max_abs_score <- NA_real_
+      obs$null_selection_frequency <- NA_real_
+      obs$empirical_p_is_active <- NA_real_
+      obs$empirical_p_abs_score <- NA_real_
+    } else {
+      obs$n_null <- nrow(nn)
+      obs$n_null_active <- sum(as.logical(nn$is_active), na.rm = TRUE)
+      obs$null_mean_abs_score <- zentangler_mean_or_na(nn$abs_score)
+      obs$null_max_abs_score <- zentangler_max_finite_or_na(nn$abs_score)
+      obs$null_selection_frequency <- zentangler_mean_or_na(as.numeric(nn$is_active))
+      obs$empirical_p_is_active <- zentangler_empirical_ge(
+        null_vals = as.numeric(nn$is_active),
+        obs_val = as.numeric(obs$is_active[[1L]])
+      )
+      obs$empirical_p_abs_score <- zentangler_empirical_ge(
+        null_vals = nn$abs_score,
+        obs_val = obs$abs_score[[1L]]
+      )
+    }
+    obs
+  })
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+zentangler_sequential_empirical_path_summary <- function(observed_stats, null_stats) {
+  if (!is.data.frame(observed_stats) || nrow(observed_stats) == 0L) return(data.frame())
+  if (!is.data.frame(null_stats) || nrow(null_stats) == 0L) {
+    out <- observed_stats
+    out$n_null <- 0L
+    out$n_null_active <- 0L
+    out$null_mean_abs_sequential_score <- NA_real_
+    out$null_max_abs_sequential_score <- NA_real_
+    out$null_selection_frequency <- NA_real_
+    out$empirical_p_is_active <- NA_real_
+    out$empirical_p_abs_sequential_score <- NA_real_
+    rownames(out) <- NULL
+    return(out)
+  }
+  null_split <- split(null_stats, null_stats$path_id)
+  rows <- lapply(seq_len(nrow(observed_stats)), function(ii) {
+    obs <- observed_stats[ii, , drop = FALSE]
+    nn <- null_split[[as.character(obs$path_id[[1L]])]]
+    if (is.null(nn) || nrow(nn) == 0L) {
+      obs$n_null <- 0L
+      obs$n_null_active <- 0L
+      obs$null_mean_abs_sequential_score <- NA_real_
+      obs$null_max_abs_sequential_score <- NA_real_
+      obs$null_selection_frequency <- NA_real_
+      obs$empirical_p_is_active <- NA_real_
+      obs$empirical_p_abs_sequential_score <- NA_real_
+    } else {
+      obs$n_null <- nrow(nn)
+      obs$n_null_active <- sum(as.logical(nn$is_active), na.rm = TRUE)
+      obs$null_mean_abs_sequential_score <- zentangler_mean_or_na(nn$abs_sequential_score)
+      obs$null_max_abs_sequential_score <- zentangler_max_finite_or_na(nn$abs_sequential_score)
+      obs$null_selection_frequency <- zentangler_mean_or_na(as.numeric(nn$is_active))
+      obs$empirical_p_is_active <- zentangler_empirical_ge(
+        null_vals = as.numeric(nn$is_active),
+        obs_val = as.numeric(obs$is_active[[1L]])
+      )
+      obs$empirical_p_abs_sequential_score <- zentangler_empirical_ge(
+        null_vals = nn$abs_sequential_score,
+        obs_val = obs$abs_sequential_score[[1L]]
+      )
+    }
+    obs
+  })
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
 zentangler_summarize_parallel_negative_control <- function(
   fit,
   q_threshold = 0.25,
@@ -214,8 +385,10 @@ zentangler_sequential_empirical_summary <- function(observed_summary, null_summa
 #'   for all null runs; otherwise only return their summaries.
 #' @param ... Additional arguments passed to `fit_multiview_parallel_zentangler()`.
 #'
-#' @return A list containing the observed fit, observed summary, null summaries,
-#'   empirical summary, and optionally the null fits.
+#' @return A list containing the observed fit, observed summary,
+#'   observed mediator-level summary, null summaries, null mediator-level
+#'   summaries, empirical summary, empirical mediator-level summary, and
+#'   optionally the null fits.
 #' @export
 run_parallel_negative_controls <- function(
   mae,
@@ -254,8 +427,17 @@ run_parallel_negative_controls <- function(
     fit_seed = observed_seed,
     permutation_seed = NA_integer_
   )
+  observed_mediator_stats <- zentangler_make_parallel_mediator_stat_table(
+    fit = observed_fit,
+    q_threshold = q_threshold,
+    perm_id = 0L,
+    null_type = "observed",
+    fit_seed = observed_seed,
+    permutation_seed = NA_integer_
+  )
 
   null_rows <- vector("list", n_perm)
+  null_mediator_rows <- vector("list", n_perm)
   null_fits <- if (isTRUE(return_null_fits)) vector("list", n_perm) else NULL
   for (perm_id in seq_len(n_perm)) {
     perm_seed <- zentangler_perm_seed(seed = seed, perm_id = perm_id)
@@ -281,21 +463,36 @@ run_parallel_negative_controls <- function(
       fit_seed = fit_seed,
       permutation_seed = perm_seed
     )
+    null_mediator_rows[[perm_id]] <- zentangler_make_parallel_mediator_stat_table(
+      fit = fit_null,
+      q_threshold = q_threshold,
+      perm_id = perm_id,
+      null_type = null_type,
+      fit_seed = fit_seed,
+      permutation_seed = perm_seed
+    )
     if (isTRUE(return_null_fits)) null_fits[[perm_id]] <- fit_null
   }
 
-  null_summaries <- do.call(rbind, null_rows)
-  rownames(null_summaries) <- NULL
+  null_summaries <- zentangler_bind_nonempty_rows(null_rows)
+  null_mediator_summaries <- zentangler_bind_nonempty_rows(null_mediator_rows)
   empirical_summary <- zentangler_parallel_empirical_summary(
     observed_summary = observed_summary,
     null_summaries = null_summaries
+  )
+  empirical_mediator_summary <- zentangler_parallel_empirical_mediator_summary(
+    observed_stats = observed_mediator_stats,
+    null_stats = null_mediator_summaries
   )
 
   out <- list(
     observed_fit = observed_fit,
     observed_summary = observed_summary,
+    observed_mediator_summary = observed_mediator_stats,
     null_summaries = null_summaries,
+    null_mediator_summaries = null_mediator_summaries,
     empirical_summary = empirical_summary,
+    empirical_mediator_summary = empirical_mediator_summary,
     settings = list(
       model_type = "parallel",
       null_type = null_type,
@@ -334,8 +531,10 @@ run_parallel_negative_controls <- function(
 #'   for all null runs; otherwise only return their summaries.
 #' @param ... Additional arguments passed to `fit_sequential_zentangler()`.
 #'
-#' @return A list containing the observed fit, observed summary, null summaries,
-#'   empirical summary, and optionally the null fits.
+#' @return A list containing the observed fit, observed summary,
+#'   observed path-level summary, null summaries, null path-level summaries,
+#'   empirical summary, empirical path-level summary, and optionally the null
+#'   fits.
 #' @export
 run_sequential_negative_controls <- function(
   mae,
@@ -376,8 +575,17 @@ run_sequential_negative_controls <- function(
     fit_seed = observed_seed,
     permutation_seed = NA_integer_
   )
+  observed_path_stats <- zentangler_make_sequential_path_stat_table(
+    fit = observed_fit,
+    q_threshold = q_threshold,
+    perm_id = 0L,
+    null_type = "observed",
+    fit_seed = observed_seed,
+    permutation_seed = NA_integer_
+  )
 
   null_rows <- vector("list", n_perm)
+  null_path_rows <- vector("list", n_perm)
   null_fits <- if (isTRUE(return_null_fits)) vector("list", n_perm) else NULL
   for (perm_id in seq_len(n_perm)) {
     perm_seed <- zentangler_perm_seed(seed = seed, perm_id = perm_id)
@@ -404,21 +612,36 @@ run_sequential_negative_controls <- function(
       fit_seed = fit_seed,
       permutation_seed = perm_seed
     )
+    null_path_rows[[perm_id]] <- zentangler_make_sequential_path_stat_table(
+      fit = fit_null,
+      q_threshold = q_threshold,
+      perm_id = perm_id,
+      null_type = null_type,
+      fit_seed = fit_seed,
+      permutation_seed = perm_seed
+    )
     if (isTRUE(return_null_fits)) null_fits[[perm_id]] <- fit_null
   }
 
-  null_summaries <- do.call(rbind, null_rows)
-  rownames(null_summaries) <- NULL
+  null_summaries <- zentangler_bind_nonempty_rows(null_rows)
+  null_path_summaries <- zentangler_bind_nonempty_rows(null_path_rows)
   empirical_summary <- zentangler_sequential_empirical_summary(
     observed_summary = observed_summary,
     null_summaries = null_summaries
+  )
+  empirical_path_summary <- zentangler_sequential_empirical_path_summary(
+    observed_stats = observed_path_stats,
+    null_stats = null_path_summaries
   )
 
   out <- list(
     observed_fit = observed_fit,
     observed_summary = observed_summary,
+    observed_path_summary = observed_path_stats,
     null_summaries = null_summaries,
+    null_path_summaries = null_path_summaries,
     empirical_summary = empirical_summary,
+    empirical_path_summary = empirical_path_summary,
     settings = list(
       model_type = "sequential",
       null_type = null_type,

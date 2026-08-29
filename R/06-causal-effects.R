@@ -17,39 +17,88 @@ infer_effect_contrast <- function(X, x0 = NULL, x1 = NULL) {
   c(x0 = x0, x1 = x1, delta = x1 - x0)
 }
 
-estimate_reduced_x_effect <- function(Y, X, C = NULL, y_family = c("gaussian", "binomial", "survival"), x0 = NULL, x1 = NULL) {
+estimate_reduced_x_summary <- function(Y, X, C = NULL, y_family = c("gaussian", "binomial", "survival"), x0 = NULL, x1 = NULL) {
   y_family <- match.arg(y_family)
   contrast <- infer_effect_contrast(X, x0 = x0, x1 = x1)
-
-  W <- cbind(`(Intercept)` = 1, X = as.numeric(X))
-  if (!is.null(C) && ncol(C) > 0) W <- cbind(W, as.matrix(C))
-  W <- as.matrix(W)
+  dat <- data.frame(Y = I(Y), X = as.numeric(X), check.names = TRUE)
+  if (!is.null(C) && ncol(C) > 0) {
+    C_df <- as.data.frame(C, check.names = TRUE)
+    colnames(C_df) <- make.names(colnames(C_df), unique = TRUE)
+    dat <- cbind(dat, C_df)
+  }
 
   fit <- try(
     if (identical(y_family, "survival")) {
-      dat <- as.data.frame(W[, -1, drop = FALSE], check.names = TRUE)
       survival::coxph(Y ~ ., data = dat)
     } else if (identical(y_family, "gaussian")) {
-      lm.fit(x = W, y = as.numeric(Y))
+      stats::lm(Y ~ ., data = dat)
     } else {
-      suppressWarnings(glm.fit(x = W, y = as.numeric(Y), family = binomial(), intercept = FALSE))
+      suppressWarnings(stats::glm(Y ~ ., data = dat, family = stats::binomial()))
     },
     silent = TRUE
   )
-  if (inherits(fit, "try-error") || is.null(fit$coefficients)) return(NA_real_)
+  if (inherits(fit, "try-error") || is.null(stats::coef(fit))) {
+    return(data.frame(
+      reduced_total_effect = NA_real_,
+      reduced_total_effect_coefficient = NA_real_,
+      p_reduced_total_effect = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
 
-  out <- as.numeric(fit$coefficients["X"])
-  if (!is.finite(out)) return(NA_real_)
-  if (identical(y_family, "survival")) return(out * contrast[["delta"]])
-  if (identical(y_family, "gaussian")) return(out * contrast[["delta"]])
+  co <- stats::coef(fit)
+  x_coef <- suppressWarnings(as.numeric(co["X"]))
+  if (!is.finite(x_coef)) x_coef <- NA_real_
 
-  co <- fit$coefficients
-  co[!is.finite(co)] <- 0
-  W0 <- W
-  W1 <- W
-  W0[, "X"] <- contrast[["x0"]]
-  W1[, "X"] <- contrast[["x1"]]
-  mean(stats::plogis(as.numeric(W1 %*% co)) - stats::plogis(as.numeric(W0 %*% co)), na.rm = TRUE)
+  p_value <- NA_real_
+  if (identical(y_family, "survival")) {
+    sm <- try(summary(fit), silent = TRUE)
+    if (!inherits(sm, "try-error") && !is.null(sm$coefficients) && "X" %in% rownames(sm$coefficients)) {
+      p_value <- suppressWarnings(as.numeric(sm$coefficients["X", "Pr(>|z|)"]))
+    }
+    effect <- if (is.finite(x_coef)) x_coef * contrast[["delta"]] else NA_real_
+  } else if (identical(y_family, "gaussian")) {
+    sm <- try(summary(fit), silent = TRUE)
+    if (!inherits(sm, "try-error") && !is.null(sm$coefficients) && "X" %in% rownames(sm$coefficients)) {
+      p_value <- suppressWarnings(as.numeric(sm$coefficients["X", "Pr(>|t|)"]))
+    }
+    effect <- if (is.finite(x_coef)) x_coef * contrast[["delta"]] else NA_real_
+  } else {
+    sm <- try(summary(fit), silent = TRUE)
+    if (!inherits(sm, "try-error") && !is.null(sm$coefficients) && "X" %in% rownames(sm$coefficients)) {
+      p_value <- suppressWarnings(as.numeric(sm$coefficients["X", "Pr(>|z|)"]))
+    }
+    co[!is.finite(co)] <- 0
+    W <- stats::model.matrix(fit)
+    W0 <- W
+    W1 <- W
+    x_col <- which(colnames(W) == "X")
+    if (length(x_col) == 1L) {
+      W0[, x_col] <- contrast[["x0"]]
+      W1[, x_col] <- contrast[["x1"]]
+      effect <- mean(stats::plogis(as.numeric(W1 %*% co)) - stats::plogis(as.numeric(W0 %*% co)), na.rm = TRUE)
+    } else {
+      effect <- NA_real_
+    }
+  }
+
+  data.frame(
+    reduced_total_effect = effect,
+    reduced_total_effect_coefficient = x_coef,
+    p_reduced_total_effect = p_value,
+    stringsAsFactors = FALSE
+  )
+}
+
+estimate_reduced_x_effect <- function(Y, X, C = NULL, y_family = c("gaussian", "binomial", "survival"), x0 = NULL, x1 = NULL) {
+  estimate_reduced_x_summary(
+    Y = Y,
+    X = X,
+    C = C,
+    y_family = y_family,
+    x0 = x0,
+    x1 = x1
+  )$reduced_total_effect[[1L]]
 }
 
 make_active_mediator_matrix <- function(combined_mediators, blocks) {
@@ -167,7 +216,8 @@ compute_effect_decomposition_multiview <- function(
   if (identical(y_family, "survival")) {
     direct_linear_product <- as.numeric(direct_effect) * delta_x
     indirect_linear_product <- if (nrow(active_map) > 0) sum(active_map$a * active_map$b_original * delta_x, na.rm = TRUE) else 0
-    reduced_te <- estimate_reduced_x_effect(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+    reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+    reduced_te <- reduced_summary$reduced_total_effect[[1L]]
     return(data.frame(
       effect_method = "cox_log_hazard_product_summary",
       effect_scale = "log_hazard_ratio",
@@ -179,6 +229,8 @@ compute_effect_decomposition_multiview <- function(
       te = direct_linear_product + indirect_linear_product,
       prop_mediated = if (is.finite(reduced_te) && abs(reduced_te) > 1e-08) indirect_linear_product / reduced_te else NA_real_,
       reduced_total_effect = reduced_te,
+      reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
+      p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
       decomposition_gap = NA_real_,
       direct_effect = direct_linear_product,
       indirect_total = indirect_linear_product,
@@ -221,7 +273,8 @@ compute_effect_decomposition_multiview <- function(
   nde <- mean(mu_10 - mu_00, na.rm = TRUE)
   nie <- mean(mu_11 - mu_10, na.rm = TRUE)
   te <- mean(mu_11 - mu_00, na.rm = TRUE)
-  reduced_te <- estimate_reduced_x_effect(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+  reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+  reduced_te <- reduced_summary$reduced_total_effect[[1L]]
 
   direct_coef <- if ("X" %in% names(co)) as.numeric(co[["X"]]) else NA_real_
   direct_linear_product <- as.numeric(direct_effect) * delta_x
@@ -238,6 +291,8 @@ compute_effect_decomposition_multiview <- function(
     te = te,
     prop_mediated = if (is.finite(te) && abs(te) > 1e-08) nie / te else NA_real_,
     reduced_total_effect = reduced_te,
+    reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
+    p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
     decomposition_gap = te - (nde + nie),
     direct_effect = nde,
     indirect_total = nie,
@@ -418,13 +473,16 @@ compute_effect_decomposition_sequential <- function(
   delta_x <- contrast[["delta"]]
   active_keys <- zentangler_sequential_active_keys(sequential_paths)
   if (length(active_keys) == 0L) {
-    reduced_te <- estimate_reduced_x_effect(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+    reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+    reduced_te <- reduced_summary$reduced_total_effect[[1L]]
     return(data.frame(
       effect_method = if (identical(y_family, "binomial")) "parametric_g_computation_logistic_sequential" else if (identical(y_family, "survival")) "cox_log_hazard_product_summary_sequential" else "parametric_g_computation_linear_sequential",
       effect_scale = if (identical(y_family, "binomial")) "risk_difference" else if (identical(y_family, "survival")) "log_hazard_ratio" else "mean_difference",
       x0 = x0, x1 = x1, delta_x = delta_x,
       nde = reduced_te, nie_total = 0, te = reduced_te,
       prop_mediated = 0, reduced_total_effect = reduced_te,
+      reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
+      p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
       decomposition_gap = 0, direct_effect = reduced_te, indirect_total = 0,
       total_decomp = reduced_te, n_active_paths = 0L, n_active_mediators = 0L,
       n_active_edges = 0L, indirect_product_sum = 0,
@@ -437,8 +495,9 @@ compute_effect_decomposition_sequential <- function(
   effect_fit <- fit_active_outcome_effect_model(Y = Y, X = X, M_active = M_obs, C = C, y_family = y_family)
   co <- effect_fit$coefficients
   Z_template <- effect_fit$design
+  reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
   if (identical(y_family, "survival")) {
-    reduced_te <- estimate_reduced_x_effect(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+    reduced_te <- reduced_summary$reduced_total_effect[[1L]]
     path_scores <- sequential_paths$sequential_score[is.finite(sequential_paths$sequential_score) & is.finite(sequential_paths$b) & sequential_paths$b != 0]
     indirect_linear_product <- sum(path_scores, na.rm = TRUE) * delta_x
     direct_linear_product <- if ("X" %in% names(co)) as.numeric(co[["X"]]) * delta_x else reduced_te - indirect_linear_product
@@ -448,7 +507,10 @@ compute_effect_decomposition_sequential <- function(
       x0 = x0, x1 = x1, delta_x = delta_x,
       nde = direct_linear_product, nie_total = indirect_linear_product, te = direct_linear_product + indirect_linear_product,
       prop_mediated = if (is.finite(reduced_te) && abs(reduced_te) > 1e-08) indirect_linear_product / reduced_te else NA_real_,
-      reduced_total_effect = reduced_te, decomposition_gap = NA_real_,
+      reduced_total_effect = reduced_te,
+      reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
+      p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
+      decomposition_gap = NA_real_,
       direct_effect = direct_linear_product, indirect_total = indirect_linear_product, total_decomp = direct_linear_product + indirect_linear_product,
       n_active_paths = nrow(sequential_paths), n_active_mediators = length(active_keys), n_active_edges = nrow(model_info$edge_table),
       indirect_product_sum = indirect_linear_product,
@@ -463,7 +525,7 @@ compute_effect_decomposition_sequential <- function(
   nde <- mean(mu_10 - mu_00, na.rm = TRUE)
   nie <- mean(mu_11 - mu_10, na.rm = TRUE)
   te <- mean(mu_11 - mu_00, na.rm = TRUE)
-  reduced_te <- estimate_reduced_x_effect(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+  reduced_te <- reduced_summary$reduced_total_effect[[1L]]
   stage_counts <- table(vapply(model_info$models, function(x) x$stage %||% 1L, integer(1)))
   out <- data.frame(
     effect_method = if (identical(y_family, "binomial")) "parametric_g_computation_logistic_sequential" else "parametric_g_computation_linear_sequential",
@@ -471,7 +533,10 @@ compute_effect_decomposition_sequential <- function(
     x0 = x0, x1 = x1, delta_x = delta_x,
     nde = nde, nie_total = nie, te = te,
     prop_mediated = if (is.finite(te) && abs(te) > 1e-08) nie / te else NA_real_,
-    reduced_total_effect = reduced_te, decomposition_gap = te - (nde + nie),
+    reduced_total_effect = reduced_te,
+    reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
+    p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
+    decomposition_gap = te - (nde + nie),
     direct_effect = nde, indirect_total = nie, total_decomp = te,
     n_active_paths = nrow(sequential_paths), n_active_mediators = length(active_keys), n_active_edges = nrow(model_info$edge_table),
     indirect_product_sum = sum(sequential_paths$sequential_score[is.finite(sequential_paths$sequential_score) & is.finite(sequential_paths$b) & sequential_paths$b != 0], na.rm = TRUE) * delta_x,
