@@ -46,12 +46,32 @@ manifest <- function(manifest_file) {
   tab
 }
 
+read_cases <- function(case_file) {
+  tab <- utils::read.csv(case_file, stringsAsFactors = FALSE, check.names = FALSE)
+  needed <- c("exposure_mode", "outcome")
+  missing_needed <- setdiff(needed, colnames(tab))
+  if (length(missing_needed) > 0L) {
+    stop("Cases file is missing columns: ", paste(missing_needed, collapse = ", "), call. = FALSE)
+  }
+  tab$exposure_mode <- as.character(tab$exposure_mode)
+  tab$outcome <- as.character(tab$outcome)
+  if (!("exposure_label" %in% colnames(tab))) tab$exposure_label <- tab$exposure_mode
+  tab$exposure_label <- as.character(tab$exposure_label)
+  tab <- tab[nzchar(tab$exposure_mode) & nzchar(tab$outcome), c("exposure_mode", "exposure_label", "outcome"), drop = FALSE]
+  if (nrow(tab) == 0L) stop("Cases file contains no usable rows.", call. = FALSE)
+  rownames(tab) <- NULL
+  tab
+}
+
 args <- parse_args(commandArgs(trailingOnly = TRUE))
 if (is.null(args$manifest)) stop("Missing --manifest", call. = FALSE)
 if (is.null(args$out)) stop("Missing --out", call. = FALSE)
 
 mae_tab <- manifest(args$manifest)
-outcomes <- split_arg(args$outcomes)
+# --fusion values: "multiview" (default cooperative-learning model) and the
+# supplementary IntegratedLearner-style "early" / "late". The grid column keeps
+# the name fusion_mode; run_parallel_hpc_task.R translates it to the
+# fusion / integrated_learner_fusion arguments.
 fusion_modes <- split_arg(args$fusion, default = c("early", "late"))
 sis_grid <- as_num_vec(args$sis, default = c(10, 25, 50, 100))
 alpha_grid <- as_num_vec(args$alpha, default = c(0, 0.5, 1))
@@ -59,37 +79,77 @@ x_var <- if (!is.null(args$`x-var`)) as.character(args$`x-var`) else "treatment_
 y_family <- if (!is.null(args$`y-family`)) as.character(args$`y-family`) else "gaussian"
 covariates <- paste(split_arg(args$covariates), collapse = ",")
 screen_method <- if (!is.null(args$`screen-method`)) as.character(args$`screen-method`) else "sis"
-method_preset <- if (!is.null(args$`method-preset`)) as.character(args$`method-preset`) else "custom"
+preset <- if (!is.null(args$`method-preset`)) as.character(args$`method-preset`) else "custom"
 lambda_choice <- if (!is.null(args$`lambda-choice`)) as.character(args$`lambda-choice`) else "lambda.min"
-b_inference <- if (!is.null(args$`b-inference`)) as.character(args$`b-inference`) else "debiased_lasso"
+b_inference <- if (!is.null(args$`b-inference`)) as.character(args$`b-inference`) else "debiased"
+# Legacy B-path inference names all map to the single de-biased estimator.
+if (b_inference %in% c("debiased_lasso", "debiased_logistic_lasso", "debiased_cox_lasso", "refit")) b_inference <- "debiased"
+a_stage_model <- "lm"
+
+# Method presets were removed from Zentangler; --method-preset is translated
+# here into the explicit options it implied (written as grid columns).
+if (!identical(preset, "custom")) {
+  if (identical(preset, "fast_lasso")) {
+    fusion_modes <- "early"; lambda_choice <- "lambda.1se"; alpha_grid <- 1
+  } else if (identical(preset, "elastic_net")) {
+    fusion_modes <- "early"; lambda_choice <- "lambda.min"; alpha_grid <- 0.5
+  } else if (identical(preset, "longitudinal_maaslin2")) {
+    fusion_modes <- "early"; a_stage_model <- "maaslin2"
+  } else if (identical(preset, "full_exploratory")) {
+    screen_method <- "none"; fusion_modes <- "early"; lambda_choice <- "lambda.min"; alpha_grid <- 0.5
+  } else {
+    stop("Unknown --method-preset: ", preset, call. = FALSE)
+  }
+}
 fdr_method <- if (!is.null(args$`fdr-method`)) as.character(args$`fdr-method`) else "BH"
 fdr_scope <- if (!is.null(args$`fdr-scope`)) as.character(args$`fdr-scope`) else "global"
 
-if (length(outcomes) == 0L) stop("Provide at least one outcome via --outcomes.", call. = FALSE)
+case_tab <- if (!is.null(args$cases)) {
+  read_cases(args$cases)
+} else {
+  outcomes <- split_arg(args$outcomes)
+  exposure_modes <- split_arg(args$`exposure-modes`, default = "existing")
+  if (length(outcomes) == 0L) stop("Provide at least one outcome via --outcomes, or provide --cases.", call. = FALSE)
+  expand.grid(
+    exposure_mode = exposure_modes,
+    outcome = outcomes,
+    stringsAsFactors = FALSE,
+    KEEP.OUT.ATTRS = FALSE
+  )
+}
+if (!("exposure_label" %in% colnames(case_tab))) case_tab$exposure_label <- case_tab$exposure_mode
 
 grid <- expand.grid(
   mae = mae_tab$mae,
   fusion_mode = fusion_modes,
   sis_n = sis_grid,
   glmnet_alpha = alpha_grid,
-  outcome = outcomes,
+  case_id = seq_len(nrow(case_tab)),
   stringsAsFactors = FALSE,
   KEEP.OUT.ATTRS = FALSE
 )
 grid <- merge(grid, mae_tab, by = "mae", all.x = TRUE, sort = FALSE)
+grid <- merge(
+  grid,
+  cbind(case_id = seq_len(nrow(case_tab)), case_tab, stringsAsFactors = FALSE),
+  by = "case_id",
+  all.x = TRUE,
+  sort = FALSE
+)
 grid$x_var <- x_var
 grid$y_family <- y_family
 grid$covariates <- covariates
 grid$screen_method <- screen_method
-grid$method_preset <- method_preset
+grid$a_stage_model <- a_stage_model
 grid$lambda_choice <- lambda_choice
 grid$b_inference <- b_inference
 grid$fdr_method <- fdr_method
 grid$fdr_scope <- fdr_scope
 grid$job_id <- seq_len(nrow(grid))
 grid <- grid[, c(
-  "job_id", "mae", "mae_file", "x_var", "outcome", "y_family",
-  "covariates", "method_preset", "screen_method", "sis_n",
+  "job_id", "mae", "mae_file", "exposure_mode", "exposure_label",
+  "x_var", "outcome", "y_family",
+  "covariates", "a_stage_model", "screen_method", "sis_n",
   "glmnet_alpha", "lambda_choice", "fusion_mode", "b_inference",
   "fdr_method", "fdr_scope"
 ), drop = FALSE]

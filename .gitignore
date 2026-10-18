@@ -47,3 +47,24 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Local OS files
+.DS_Store
+
+# Local temp workspaces
+.tmp/
+*.tmp
+
+# Generated local data payloads
+data/*.RData
+data/*.rds
+data/*.xlsx
+inst/data/*.RData
+inst/data/*.rds
+inst/data/*.xlsx
+
+# Superseded code kept locally, not tracked
+retired/
+inst/
+*.pptx
+*.pptx.inspect.ndjson

@@ -1,90 +1,39 @@
 # -----------------------------------------------------------------------------
-# B-stage p-values and effect summaries
+# B-stage inference
+#
+# Two inference engines are supported everywhere in the package:
+#
+#   b_inference = "debiased"   De-biased (de-sparsified) lasso on the joint
+#                              outcome model Y ~ X + C + all screened mediators.
+#                              Every screened mediator is a target, not only the
+#                              lasso-active ones, so p_b exists for the whole
+#                              screened set (HIMA2-style). Gaussian and logistic
+#                              outcomes use nodewise-lasso de-biasing (van de
+#                              Geer et al. 2014); Cox outcomes use the
+#                              de-sparsified partial-likelihood estimator
+#                              (Fang, Ning & Liu 2017; Kong et al. 2021) with a
+#                              nodewise lasso on the partial-likelihood
+#                              information matrix.
+#
+#   b_inference = "bootstrap"  Full-pipeline bootstrap. Each replicate re-runs
+#                              screening and the outcome model; p_b is the
+#                              percentile-interval inversion p-value of the
+#                              fusion coefficient (see 07-bootstrap.R).
+#
+# Naive active-set refits (OLS / GLM / Cox Wald on the lasso-selected set) have
+# been removed: they ignore selection and are anti-conservative.
 # -----------------------------------------------------------------------------
 
-infer_p_b_multiview_refit <- function(Y, X, blocks, C = NULL, coef_by_view, y_family = c("gaussian", "binomial", "survival")) {
-  y_family <- match.arg(y_family)
-  out <- lapply(blocks, function(M) setNames(rep(NA_real_, ncol(M)), colnames(M)))
-
-  active_design <- character(0)
-  active_map <- data.frame(view = character(), mediator = character(), design_name = character())
-
-  for (view in names(blocks)) {
-    b <- coef_by_view[[view]]
-    active <- names(b)[is.finite(b) & b != 0]
-    if (length(active) == 0) next
-
-    dn <- paste0(view, "::", active)
-    active_design <- c(active_design, dn)
-    active_map <- rbind(
-      active_map,
-      data.frame(view = view, mediator = active, design_name = dn, stringsAsFactors = FALSE)
-    )
+zentangler_validate_b_inference <- function(method) {
+  method <- as.character(method)[1]
+  if (identical(method, "refit")) {
+    stop("b_inference = 'refit' was removed because active-set refits ignore lasso selection. Use 'debiased' or 'bootstrap'.", call. = FALSE)
   }
-  if (length(active_design) == 0) return(out)
-
-  active_views <- unique(active_map$view)
-  active_blocks <- lapply(active_views, function(view) {
-    blocks[[view]][, active_map$mediator[active_map$view == view], drop = FALSE]
-  })
-  names(active_blocks) <- active_views
-
-  pref <- prefix_multiview_blocks(active_blocks)
-  M_active <- pref$X[, intersect(colnames(pref$X), active_design), drop = FALSE]
-
-  Z <- cbind(`(Intercept)` = 1, X = X)
-  if (!is.null(C) && ncol(C) > 0) Z <- cbind(Z, as.matrix(C))
-  Z <- cbind(Z, M_active)
-
-  if (identical(y_family, "survival")) {
-    raw_names <- colnames(Z)[-1]
-    safe_names <- make.names(raw_names, unique = TRUE)
-    dat <- as.data.frame(Z[, -1, drop = FALSE], check.names = FALSE)
-    colnames(dat) <- safe_names
-    fit <- try(suppressWarnings(survival::coxph(Y ~ ., data = dat)), silent = TRUE)
-    if (inherits(fit, "try-error")) return(out)
-    sm <- summary(fit)$coefficients
-    if (is.null(sm) || nrow(sm) == 0) return(out)
-    p_col <- grep("^Pr\\(", colnames(sm), value = TRUE)
-    if (length(p_col) == 0) p_col <- colnames(sm)[ncol(sm)]
-    pvals <- sm[, p_col[[1]]]
-    names(pvals) <- raw_names[match(rownames(sm), safe_names)]
-  } else if (identical(y_family, "gaussian")) {
-    fit <- lm.fit(x = as.matrix(Z), y = as.numeric(Y))
-    rank <- fit$rank
-    df <- nrow(Z) - rank
-    if (df <= 0) return(out)
-
-    rss <- sum(fit$residuals^2)
-    sigma2 <- rss / df
-    R <- try(qr.R(fit$qr)[seq_len(rank), seq_len(rank), drop = FALSE], silent = TRUE)
-    if (inherits(R, "try-error")) return(out)
-    xtx_inv <- try(chol2inv(R), silent = TRUE)
-    if (inherits(xtx_inv, "try-error")) return(out)
-
-    beta <- fit$coefficients
-    se <- rep(NA_real_, length(beta))
-    se[fit$qr$pivot[seq_len(rank)]] <- sqrt(diag(xtx_inv) * sigma2)
-    names(se) <- names(beta)
-    pvals <- 2 * stats::pt(abs(beta / se), df = df, lower.tail = FALSE)
-  } else {
-    dat <- as.data.frame(Z, check.names = TRUE)
-    safe_names <- colnames(dat)
-    fit <- try(suppressWarnings(glm(Y ~ . - 1, data = cbind(Y = Y, dat), family = binomial())), silent = TRUE)
-    if (inherits(fit, "try-error")) return(out)
-    sm <- summary(fit)$coefficients
-    pvals <- sm[, ncol(sm)]
-    names(pvals) <- colnames(Z)[match(rownames(sm), safe_names)]
+  if (method %in% c("debiased_lasso", "debiased_logistic_lasso", "debiased_cox_lasso")) {
+    stop("b_inference = '", method, "' is now spelled 'debiased' (the family is taken from y_family).", call. = FALSE)
   }
-
-  for (i in seq_len(nrow(active_map))) {
-    view <- active_map$view[i]
-    med <- active_map$mediator[i]
-    dn <- active_map$design_name[i]
-    if (dn %in% names(pvals)) out[[view]][med] <- as.numeric(pvals[dn])
-  }
-
-  out
+  # "none" is internal: bootstrap replicates need point estimates only.
+  match.arg(method, c("debiased", "bootstrap", "none"))
 }
 
 pick_lambda_from_cv <- function(cvfit, lambda_choice = c("lambda.1se", "lambda.min")) {
@@ -97,384 +46,276 @@ pick_lambda_from_cv <- function(cvfit, lambda_choice = c("lambda.1se", "lambda.m
   lam
 }
 
-debiased_lasso_pvals_multiview_gaussian <- function(
-  Y,
-  X,
-  blocks,
-  C = NULL,
-  coef_by_view,
-  lambda_choice = c("lambda.1se", "lambda.min"),
-  max_targets = 200L
-) {
-  # HIMA-style de-biased lasso for the B-stage.
-  #
-  # This uses the whole SIS-selected multiview design, then de-biases the
-  # nonzero lasso targets. It is more defensible than active-set refit because
-  # it corrects lasso shrinkage, but it is still not a complete selective
-  # inference theorem for the full screening + fusion pipeline.
-  lambda_choice <- match.arg(lambda_choice)
-
-  out <- lapply(blocks, function(M) setNames(rep(NA_real_, ncol(M)), colnames(M)))
-
-  active_map <- data.frame(view = character(), mediator = character(), design_name = character())
-  for (view in names(blocks)) {
-    b <- coef_by_view[[view]]
-    active <- names(b)[is.finite(b) & b != 0]
-    if (length(active) == 0) next
-    active_map <- rbind(
-      active_map,
-      data.frame(
-        view = view,
-        mediator = active,
-        design_name = paste0(view, "::", active),
-        stringsAsFactors = FALSE
-      )
-    )
+zentangler_standardize_columns <- function(Z, weights = NULL) {
+  Z <- as.matrix(Z)
+  if (is.null(weights)) {
+    ctr <- colMeans(Z)
+  } else {
+    ctr <- colSums(Z * weights) / sum(weights)
   }
-  if (nrow(active_map) == 0) {
-    return(list(p_b = out, method = "debiased_lasso_gaussian_no_active_targets"))
-  }
-
-  pref <- prefix_multiview_blocks(blocks)
-  dat <- data.frame(y = as.numeric(Y), X = as.numeric(X), check.names = FALSE)
-  x_cols <- "X"
-  if (!is.null(C) && ncol(C) > 0) {
-    C_df <- as.data.frame(C, check.names = FALSE, stringsAsFactors = FALSE)
-    colnames(C_df) <- paste0("C::", colnames(C_df))
-    dat <- cbind(dat, C_df)
-    x_cols <- c(x_cols, colnames(C_df))
-  }
-  dat <- cbind(dat, as.data.frame(pref$X, check.names = FALSE, stringsAsFactors = FALSE))
-
-  cc <- complete.cases(dat)
-  dat <- dat[cc, , drop = FALSE]
-  if (nrow(dat) < 20) {
-    return(list(p_b = out, method = "debiased_lasso_gaussian_too_few_samples"))
-  }
-
-  y <- as.numeric(dat$y)
-  Z_raw <- as.matrix(dat[, setdiff(colnames(dat), "y"), drop = FALSE])
-  n <- nrow(Z_raw)
-  p <- ncol(Z_raw)
-  if (p < 2) {
-    return(list(p_b = out, method = "debiased_lasso_gaussian_design_too_small"))
-  }
-
-  z_center <- colMeans(Z_raw)
-  z_scale <- apply(Z_raw, 2, stats::sd)
-  z_scale[!is.finite(z_scale) | z_scale < 1e-08] <- 1
-  Z <- sweep(sweep(Z_raw, 2, z_center, "-"), 2, z_scale, "/")
-  y0 <- y - mean(y)
-
-  pf <- rep(1, p)
-  names(pf) <- colnames(Z)
-  pf[colnames(Z) %in% x_cols] <- 0
-
-  cv_main <- glmnet::cv.glmnet(
-    x = Z,
-    y = y0,
-    family = "gaussian",
-    alpha = 1,
-    penalty.factor = pf,
-    standardize = FALSE,
-    intercept = FALSE
-  )
-  lam_main <- pick_lambda_from_cv(cv_main, lambda_choice = lambda_choice)
-  fit_main <- glmnet::glmnet(
-    x = Z,
-    y = y0,
-    family = "gaussian",
-    alpha = 1,
-    lambda = lam_main,
-    penalty.factor = pf,
-    standardize = FALSE,
-    intercept = FALSE
-  )
-  beta_hat <- as.numeric(glmnet::coef.glmnet(fit_main, s = lam_main))[-1]
-  names(beta_hat) <- colnames(Z)
-
-  resid <- y0 - as.numeric(Z %*% beta_hat)
-  df_eff <- sum(abs(beta_hat) > 0) + 1L
-  sigma2_hat <- sum(resid^2) / max(1, n - df_eff)
-  sigma2_hat <- max(sigma2_hat, 1e-10)
-
-  target_names <- active_map$design_name[active_map$design_name %in% colnames(Z)]
-  if (length(target_names) == 0) {
-    return(list(p_b = out, method = "debiased_lasso_gaussian_no_valid_targets"))
-  }
-
-  max_targets <- max(1L, as.integer(max_targets))
-  if (length(target_names) > max_targets) {
-    ord <- order(abs(beta_hat[target_names]), decreasing = TRUE, na.last = TRUE)
-    target_names <- target_names[ord[seq_len(max_targets)]]
-  }
-
-  p_map <- setNames(rep(NA_real_, length(target_names)), target_names)
-  for (nm in target_names) {
-    j <- match(nm, colnames(Z))
-    if (is.na(j)) next
-
-    z_j <- Z[, j]
-    z_m <- Z[, -j, drop = FALSE]
-    if (ncol(z_m) == 0) next
-
-    cv_j <- glmnet::cv.glmnet(
-      x = z_m,
-      y = z_j,
-      family = "gaussian",
-      alpha = 1,
-      standardize = FALSE,
-      intercept = FALSE
-    )
-    lam_j <- pick_lambda_from_cv(cv_j, lambda_choice = lambda_choice)
-    fit_j <- glmnet::glmnet(
-      x = z_m,
-      y = z_j,
-      family = "gaussian",
-      alpha = 1,
-      lambda = lam_j,
-      standardize = FALSE,
-      intercept = FALSE
-    )
-    gamma_j <- as.numeric(glmnet::coef.glmnet(fit_j, s = lam_j))[-1]
-    r_j <- z_j - as.numeric(z_m %*% gamma_j)
-    tau_j <- mean(z_j * r_j)
-    if (!is.finite(tau_j) || abs(tau_j) < 1e-08) next
-
-    w_j <- r_j / tau_j
-    beta_db <- beta_hat[[nm]] + mean(w_j * resid)
-    se_db <- sqrt(sigma2_hat * mean(w_j^2) / n)
-    if (!is.finite(se_db) || se_db <= 0) next
-
-    p_map[[nm]] <- 2 * stats::pnorm(-abs(beta_db / se_db))
-  }
-
-  for (i in seq_len(nrow(active_map))) {
-    view <- active_map$view[i]
-    med <- active_map$mediator[i]
-    dn <- active_map$design_name[i]
-    if (dn %in% names(p_map)) out[[view]][med] <- as.numeric(p_map[[dn]])
-  }
-
-  list(p_b = out, method = "debiased_lasso_gaussian")
+  sc <- apply(Z, 2, stats::sd)
+  sc[!is.finite(sc) | sc < 1e-10] <- 1
+  list(Z = sweep(sweep(Z, 2, ctr, "-"), 2, sc, "/"), center = ctr, scale = sc)
 }
 
-debiased_lasso_pvals_multiview_logistic <- function(
-  Y,
-  X,
-  blocks,
-  C = NULL,
-  coef_by_view,
-  lambda_choice = c("lambda.1se", "lambda.min"),
-  max_targets = 200L
-) {
-  # Approximate de-biased logistic lasso for the B-stage.
-  #
-  # This is the binomial analogue of the Gaussian de-biasing routine above. It
-  # uses a penalized logistic outcome model followed by weighted nodewise lasso
-  # corrections for active mediator coefficients. It provides an approximate
-  # Wald-style p-value for binary outcomes; it is not a full selective-inference
-  # theorem for screening + fusion.
-  lambda_choice <- match.arg(lambda_choice)
-
-  out <- lapply(blocks, function(M) setNames(rep(NA_real_, ncol(M)), colnames(M)))
-
-  y_raw <- as.numeric(Y)
-  y_unique <- sort(unique(y_raw[is.finite(y_raw)]))
-  if (length(y_unique) != 2L) {
-    return(list(p_b = out, method = "debiased_lasso_logistic_invalid_binary_y"))
-  }
-  y01 <- as.numeric(y_raw == max(y_unique))
-
-  active_map <- data.frame(view = character(), mediator = character(), design_name = character())
-  for (view in names(blocks)) {
-    b <- coef_by_view[[view]]
-    active <- names(b)[is.finite(b) & b != 0]
-    if (length(active) == 0) next
-    active_map <- rbind(
-      active_map,
-      data.frame(
-        view = view,
-        mediator = active,
-        design_name = paste0(view, "::", active),
-        stringsAsFactors = FALSE
-      )
-    )
-  }
-  if (nrow(active_map) == 0) {
-    return(list(p_b = out, method = "debiased_lasso_logistic_no_active_targets"))
-  }
-
-  pref <- prefix_multiview_blocks(blocks)
-  dat <- data.frame(y = y01, X = as.numeric(X), check.names = FALSE)
-  x_cols <- "X"
-  if (!is.null(C) && ncol(C) > 0) {
-    C_df <- as.data.frame(C, check.names = FALSE, stringsAsFactors = FALSE)
-    colnames(C_df) <- paste0("C::", colnames(C_df))
-    dat <- cbind(dat, C_df)
-    x_cols <- c(x_cols, colnames(C_df))
-  }
-  dat <- cbind(dat, as.data.frame(pref$X, check.names = FALSE, stringsAsFactors = FALSE))
-
-  cc <- complete.cases(dat)
-  dat <- dat[cc, , drop = FALSE]
-  if (nrow(dat) < 30 || length(unique(dat$y)) < 2L) {
-    return(list(p_b = out, method = "debiased_lasso_logistic_too_few_or_one_class"))
-  }
-
-  y <- as.numeric(dat$y)
-  Z_raw <- as.matrix(dat[, setdiff(colnames(dat), "y"), drop = FALSE])
-  n <- nrow(Z_raw)
-  p <- ncol(Z_raw)
-  if (p < 2) {
-    return(list(p_b = out, method = "debiased_lasso_logistic_design_too_small"))
-  }
-
-  z_center <- colMeans(Z_raw)
-  z_scale <- apply(Z_raw, 2, stats::sd)
-  z_scale[!is.finite(z_scale) | z_scale < 1e-08] <- 1
-  Z <- sweep(sweep(Z_raw, 2, z_center, "-"), 2, z_scale, "/")
-
-  pf <- rep(1, p)
-  names(pf) <- colnames(Z)
-  pf[colnames(Z) %in% x_cols] <- 0
-
-  cv_main <- glmnet::cv.glmnet(
-    x = Z,
-    y = y,
-    family = "binomial",
-    alpha = 1,
-    penalty.factor = pf,
-    standardize = FALSE,
-    intercept = TRUE
-  )
-  lam_main <- pick_lambda_from_cv(cv_main, lambda_choice = lambda_choice)
-  fit_main <- glmnet::glmnet(
-    x = Z,
-    y = y,
-    family = "binomial",
-    alpha = 1,
-    lambda = lam_main,
-    penalty.factor = pf,
-    standardize = FALSE,
-    intercept = TRUE
-  )
-  coef_main <- as.numeric(glmnet::coef.glmnet(fit_main, s = lam_main))
-  beta0_hat <- coef_main[1]
-  beta_hat <- coef_main[-1]
-  names(beta_hat) <- colnames(Z)
-
-  eta <- as.numeric(beta0_hat + Z %*% beta_hat)
-  mu <- stats::plogis(eta)
-  w <- pmax(mu * (1 - mu), 1e-05)
-  score_resid <- y - mu
-
-  target_names <- active_map$design_name[active_map$design_name %in% colnames(Z)]
-  if (length(target_names) == 0) {
-    return(list(p_b = out, method = "debiased_lasso_logistic_no_valid_targets"))
-  }
-
-  max_targets <- max(1L, as.integer(max_targets))
-  if (length(target_names) > max_targets) {
-    ord <- order(abs(beta_hat[target_names]), decreasing = TRUE, na.last = TRUE)
-    target_names <- target_names[ord[seq_len(max_targets)]]
-  }
-
-  p_map <- setNames(rep(NA_real_, length(target_names)), target_names)
-  sqrt_w <- sqrt(w)
-  for (nm in target_names) {
-    j <- match(nm, colnames(Z))
-    if (is.na(j)) next
-
-    z_j <- Z[, j]
-    z_m <- Z[, -j, drop = FALSE]
-    if (ncol(z_m) == 0) next
-
-    z_j_w <- z_j * sqrt_w
-    z_m_w <- sweep(z_m, 1, sqrt_w, "*")
-
+# Nodewise regression of column j on the remaining columns (possibly
+# row-weighted through sqrt_w). Returns the residual r_j on the unweighted scale.
+zentangler_nodewise_residual <- function(Zw, j, Z = Zw, lambda_choice = "lambda.min", nfolds = 5L) {
+  z_j <- Zw[, j]
+  z_m <- Zw[, -j, drop = FALSE]
+  if (ncol(z_m) == 0L) return(Z[, j])
+  if (ncol(z_m) == 1L) {
+    denom <- sum(z_m^2)
+    gamma <- if (denom > 0) sum(z_m * z_j) / denom else 0
+  } else {
     cv_j <- glmnet::cv.glmnet(
-      x = z_m_w,
-      y = z_j_w,
-      family = "gaussian",
-      alpha = 1,
-      standardize = FALSE,
-      intercept = FALSE
+      x = z_m, y = z_j, family = "gaussian", alpha = 1,
+      standardize = FALSE, intercept = FALSE, nfolds = nfolds
     )
     lam_j <- pick_lambda_from_cv(cv_j, lambda_choice = lambda_choice)
-    fit_j <- glmnet::glmnet(
-      x = z_m_w,
-      y = z_j_w,
-      family = "gaussian",
-      alpha = 1,
-      lambda = lam_j,
-      standardize = FALSE,
-      intercept = FALSE
-    )
-    gamma_j <- as.numeric(glmnet::coef.glmnet(fit_j, s = lam_j))[-1]
-    r_j <- z_j - as.numeric(z_m %*% gamma_j)
-    tau_j <- mean(w * z_j * r_j)
-    if (!is.finite(tau_j) || abs(tau_j) < 1e-08) next
-
-    beta_db <- beta_hat[[nm]] + mean(r_j * score_resid) / tau_j
-    se_db <- sqrt(mean(w * r_j^2) / (n * tau_j^2))
-    if (!is.finite(se_db) || se_db <= 0) next
-
-    p_map[[nm]] <- 2 * stats::pnorm(-abs(beta_db / se_db))
+    gamma <- as.numeric(glmnet::coef.glmnet(cv_j, s = lam_j))[-1]
   }
-
-  for (i in seq_len(nrow(active_map))) {
-    view <- active_map$view[i]
-    med <- active_map$mediator[i]
-    dn <- active_map$design_name[i]
-    if (dn %in% names(p_map)) out[[view]][med] <- as.numeric(p_map[[dn]])
-  }
-
-  list(p_b = out, method = "debiased_lasso_logistic")
+  Z[, j] - as.numeric(Z[, -j, drop = FALSE] %*% gamma)
 }
 
-debiased_cox_lasso_pvals_multiview <- function(
+zentangler_order_targets <- function(targets, beta_hat, max_targets) {
+  max_targets <- max(1L, as.integer(max_targets))
+  if (length(targets) <= max_targets) return(list(keep = targets, dropped = character(0)))
+  ord <- order(abs(beta_hat[targets]), decreasing = TRUE, na.last = TRUE)
+  list(keep = targets[ord[seq_len(max_targets)]], dropped = targets[ord[-seq_len(max_targets)]])
+}
+
+# Coordinate-descent lasso on a Gram matrix:
+#   min_g (1/2) g' S g - c' g + lambda ||g||_1
+zentangler_gram_lasso <- function(S, cvec, lambda, maxit = 500L, tol = 1e-07) {
+  p <- length(cvec)
+  g <- rep(0, p)
+  if (p == 0L) return(g)
+  d <- diag(S)
+  d[d <= 0] <- 1e-10
+  for (it in seq_len(maxit)) {
+    g_old <- g
+    for (k in seq_len(p)) {
+      rho_k <- cvec[k] - sum(S[k, -k] * g[-k])
+      g[k] <- sign(rho_k) * max(abs(rho_k) - lambda, 0) / d[k]
+    }
+    if (max(abs(g - g_old)) < tol) break
+  }
+  g
+}
+
+# Partial-likelihood gradient (of the average log partial likelihood) and
+# information matrix at eta = Z beta, Breslow ties.
+zentangler_cox_grad_info <- function(time, status, Z, eta) {
+  n <- nrow(Z)
+  p <- ncol(Z)
+  ord <- order(time, decreasing = TRUE)
+  time_o <- time[ord]
+  status_o <- status[ord]
+  Z_o <- Z[ord, , drop = FALSE]
+  r_o <- exp(eta[ord] - max(eta))
+  S0 <- 0
+  S1 <- rep(0, p)
+  S2 <- matrix(0, p, p)
+  grad <- rep(0, p)
+  info <- matrix(0, p, p)
+  ut <- unique(time_o)
+  pos <- 1L
+  for (t in ut) {
+    idx <- integer(0)
+    while (pos <= n && time_o[pos] == t) {
+      idx <- c(idx, pos)
+      pos <- pos + 1L
+    }
+    zi <- Z_o[idx, , drop = FALSE]
+    ri <- r_o[idx]
+    S0 <- S0 + sum(ri)
+    S1 <- S1 + colSums(zi * ri)
+    S2 <- S2 + crossprod(zi * sqrt(ri))
+    ev <- idx[status_o[idx] == 1]
+    d_t <- length(ev)
+    if (d_t == 0L) next
+    zbar <- S1 / S0
+    grad <- grad + colSums(Z_o[ev, , drop = FALSE]) - d_t * zbar
+    info <- info + d_t * (S2 / S0 - tcrossprod(zbar))
+  }
+  list(grad = grad / n, info = info / n)
+}
+
+# Generic de-biased lasso for the joint outcome model.
+#   Y          outcome (numeric, 0/1, or Surv)
+#   W          unpenalized design (X and covariates)
+#   P          penalized design (mediators), colnames are target names
+#   targets    which columns of P to de-bias
+# Returns a data.frame(name, estimate, se, p) on the original column scale.
+zentangler_debiased_lasso <- function(
   Y,
-  X,
-  blocks,
-  C = NULL,
-  coef_by_view,
+  W,
+  P,
+  targets = colnames(P),
+  y_family = c("gaussian", "binomial", "survival"),
   lambda_choice = c("lambda.1se", "lambda.min"),
-  max_targets = 200L
+  max_targets = 200L,
+  beta_init = NULL
 ) {
-  # Cox analogue for the B-stage. This currently uses lasso-selected active
-  # targets followed by Cox active-set Wald p-values; the method label makes the
-  # approximation explicit for downstream reporting.
+  # beta_init: optional initial estimator on the original column scale, named
+  # by colnames(cbind(W, P)) (missing names are treated as 0). When supplied,
+  # the one-step de-biasing correction is applied to it instead of to a fresh
+  # lasso; the de-biased estimator targets the same coefficient of the joint
+  # model, so the fused (e.g. cooperative-learning) fit can be used directly.
+  y_family <- match.arg(y_family)
   lambda_choice <- match.arg(lambda_choice)
-  p_b <- infer_p_b_multiview_refit(
-    Y = Y,
-    X = X,
-    blocks = blocks,
-    C = C,
-    coef_by_view = coef_by_view,
-    y_family = "survival"
+  empty <- data.frame(name = character(0), estimate = numeric(0), se = numeric(0), p = numeric(0), stringsAsFactors = FALSE)
+  W <- as.matrix(W)
+  P <- as.matrix(P)
+  if (ncol(P) == 0L || length(targets) == 0L) return(list(table = empty, dropped = character(0), method = "no_targets"))
+
+  Z_raw <- cbind(W, P)
+  n <- nrow(Z_raw)
+  p <- ncol(Z_raw)
+  min_n <- if (identical(y_family, "gaussian")) 20L else 30L
+  if (n < min_n) {
+    return(list(table = empty, dropped = targets, method = paste0("debiased_", y_family, "_too_few_samples")))
+  }
+  pf <- c(rep(0, ncol(W)), rep(1, ncol(P)))
+  st <- zentangler_standardize_columns(Z_raw)
+  Z <- st$Z
+  colnames(Z) <- colnames(Z_raw)
+  out_rows <- list()
+  init_std <- NULL
+  if (!is.null(beta_init)) {
+    init_std <- setNames(rep(0, ncol(Z)), colnames(Z))
+    hit <- intersect(names(beta_init), colnames(Z))
+    init_std[hit] <- as.numeric(beta_init[hit])
+    init_std[!is.finite(init_std)] <- 0
+    init_std <- init_std * st$scale
+  }
+
+  if (identical(y_family, "gaussian")) {
+    y0 <- as.numeric(Y) - mean(as.numeric(Y))
+    if (is.null(init_std)) {
+      cv_main <- glmnet::cv.glmnet(x = Z, y = y0, family = "gaussian", alpha = 1, penalty.factor = pf, standardize = FALSE, intercept = FALSE)
+      lam <- pick_lambda_from_cv(cv_main, lambda_choice)
+      beta_hat <- as.numeric(glmnet::coef.glmnet(cv_main, s = lam))[-1]
+      names(beta_hat) <- colnames(Z)
+    } else {
+      beta_hat <- init_std
+    }
+    resid <- y0 - as.numeric(Z %*% beta_hat)
+    s_hat <- sum(abs(beta_hat) > 0)
+    sigma2 <- max(sum(resid^2) / max(1, n - s_hat - 1), 1e-10)
+    tg <- zentangler_order_targets(intersect(targets, colnames(Z)), beta_hat, max_targets)
+    for (nm in tg$keep) {
+      j <- match(nm, colnames(Z))
+      r_j <- try(zentangler_nodewise_residual(Z, j), silent = TRUE)
+      if (inherits(r_j, "try-error")) next
+      denom <- sum(Z[, j] * r_j)
+      if (!is.finite(denom) || abs(denom) < 1e-10) next
+      est <- beta_hat[[nm]] + sum(r_j * resid) / denom
+      se <- sqrt(sigma2 * sum(r_j^2)) / abs(denom)
+      out_rows[[nm]] <- c(est, se)
+    }
+    method <- "debiased_lasso_gaussian"
+  } else if (identical(y_family, "binomial")) {
+    y_raw <- as.numeric(Y)
+    yu <- sort(unique(y_raw[is.finite(y_raw)]))
+    if (length(yu) != 2L || !all(yu %in% c(0, 1))) stop("Binomial outcomes must be coded 0/1.", call. = FALSE)
+    y <- y_raw
+    if (is.null(init_std)) {
+      cv_main <- glmnet::cv.glmnet(x = Z, y = y, family = "binomial", alpha = 1, penalty.factor = pf, standardize = FALSE, intercept = TRUE)
+      lam <- pick_lambda_from_cv(cv_main, lambda_choice)
+      co <- as.numeric(glmnet::coef.glmnet(cv_main, s = lam))
+      a0 <- co[1]
+      beta_hat <- co[-1]
+      names(beta_hat) <- colnames(Z)
+    } else {
+      beta_hat <- init_std
+      lp <- as.numeric(Z %*% beta_hat)
+      a0 <- suppressWarnings(stats::glm.fit(matrix(1, nrow = n), y, family = stats::binomial(), offset = lp)$coefficients[[1L]])
+    }
+    mu <- stats::plogis(a0 + as.numeric(Z %*% beta_hat))
+    w <- pmax(mu * (1 - mu), 1e-05)
+    score <- y - mu
+    # Weighted centering projects out the intercept direction, so the nodewise
+    # step can run without an intercept on the sqrt(w)-weighted design.
+    wc <- sweep(Z, 2, colSums(Z * w) / sum(w), "-")
+    Zw <- wc * sqrt(w)
+    tg <- zentangler_order_targets(intersect(targets, colnames(Z)), beta_hat, max_targets)
+    for (nm in tg$keep) {
+      j <- match(nm, colnames(Z))
+      r_j <- try(zentangler_nodewise_residual(Zw, j, Z = wc), silent = TRUE)
+      if (inherits(r_j, "try-error")) next
+      tau <- mean(w * wc[, j] * r_j)
+      if (!is.finite(tau) || abs(tau) < 1e-10) next
+      est <- beta_hat[[nm]] + mean(r_j * score) / tau
+      se <- sqrt(mean(w * r_j^2) / (n * tau^2))
+      out_rows[[nm]] <- c(est, se)
+    }
+    method <- "debiased_lasso_logistic"
+  } else {
+    if (!inherits(Y, "Surv")) stop("Survival de-biased inference requires a Surv outcome.", call. = FALSE)
+    time <- as.numeric(Y[, 1])
+    status <- as.numeric(Y[, 2])
+    if (is.null(init_std)) {
+      cv_main <- glmnet::cv.glmnet(x = Z, y = Y, family = "cox", alpha = 1, penalty.factor = pf, standardize = FALSE)
+      lam <- pick_lambda_from_cv(cv_main, lambda_choice)
+      beta_hat <- as.numeric(glmnet::coef.glmnet(cv_main, s = lam))
+      names(beta_hat) <- colnames(Z)
+    } else {
+      beta_hat <- init_std
+    }
+    gi <- zentangler_cox_grad_info(time, status, Z, as.numeric(Z %*% beta_hat))
+    Sigma <- gi$info
+    lam_node <- sqrt(log(max(p, 2)) / n)
+    tg <- zentangler_order_targets(intersect(targets, colnames(Z)), beta_hat, max_targets)
+    for (nm in tg$keep) {
+      j <- match(nm, colnames(Z))
+      gam <- zentangler_gram_lasso(Sigma[-j, -j, drop = FALSE], Sigma[-j, j], lambda = lam_node * sqrt(max(Sigma[j, j], 1e-10)))
+      tau2 <- Sigma[j, j] - sum(Sigma[j, -j] * gam)
+      if (!is.finite(tau2) || tau2 <= 1e-10) next
+      theta <- rep(0, p)
+      theta[j] <- 1
+      theta[-j] <- -gam
+      theta <- theta / tau2
+      est <- beta_hat[[nm]] + sum(theta * gi$grad)
+      v <- as.numeric(t(theta) %*% Sigma %*% theta) / n
+      if (!is.finite(v) || v <= 0) next
+      out_rows[[nm]] <- c(est, sqrt(v))
+    }
+    method <- "debiased_lasso_cox"
+  }
+
+  if (length(out_rows) == 0L) return(list(table = empty, dropped = tg$dropped, method = method))
+  mat <- do.call(rbind, out_rows)
+  nm <- rownames(mat)
+  sc <- st$scale[nm]
+  est <- mat[, 1] / sc
+  se <- mat[, 2] / sc
+  tab <- data.frame(
+    name = nm,
+    estimate = as.numeric(est),
+    se = as.numeric(se),
+    p = as.numeric(2 * stats::pnorm(-abs(mat[, 1] / mat[, 2]))),
+    stringsAsFactors = FALSE
   )
-  list(p_b = p_b, method = "debiased_cox_lasso_active_set_wald_approx")
+  list(table = tab, dropped = tg$dropped, method = method)
+}
+
+zentangler_fusion_init <- function(yfit, blocks) {
+  # Initial estimator for the de-biasing step, taken from the fused outcome
+  # model: unpenalized W coefficients plus view-prefixed mediator coefficients.
+  if (is.null(yfit$w_coef) || is.null(yfit$coef_by_view)) return(NULL)
+  med <- unlist(lapply(names(blocks), function(v) {
+    b <- yfit$coef_by_view[[v]]
+    setNames(as.numeric(b), paste0(v, "::", names(b)))
+  }), use.names = TRUE)
+  out <- c(yfit$w_coef, med)
+  out[!is.finite(out)] <- 0
+  out
 }
 
 empty_p_b_multiview <- function(blocks) {
   lapply(blocks, function(M) setNames(rep(NA_real_, ncol(M)), colnames(M)))
-}
-
-normalize_b_inference_method <- function(method) {
-  method <- as.character(method)[1]
-  if (!nzchar(method)) stop("b_inference must be a non-empty string.", call. = FALSE)
-  if (identical(method, "debiased")) return("debiased")
-  if (identical(method, "bootstrap")) return("bootstrap")
-  if (identical(method, "debiased_lasso")) return("debiased")
-  if (identical(method, "debiased_logistic_lasso")) return("debiased")
-  if (identical(method, "debiased_cox_lasso")) return("debiased")
-  if (identical(method, "refit")) return("refit")
-  stop(
-    "Unsupported b_inference: ", method,
-    ". Use 'debiased' or 'bootstrap'.",
-    call. = FALSE
-  )
 }
 
 infer_p_b_multiview <- function(
@@ -482,168 +323,132 @@ infer_p_b_multiview <- function(
   X,
   blocks,
   C = NULL,
-  coef_by_view,
+  coef_by_view = NULL,
   y_family = c("gaussian", "binomial", "survival"),
-  method = c("debiased", "bootstrap"),
+  method = c("debiased", "bootstrap", "none"),
   lambda_choice = c("lambda.1se", "lambda.min"),
-  max_debias_targets = 200L
+  max_debias_targets = 200L,
+  extra_penalized = NULL,
+  beta_init = NULL
 ) {
+  # Returns per-view lists of de-biased estimates (b), standard errors and
+  # p-values for every screened mediator. `extra_penalized` adds penalized
+  # adjustment columns (used by the sequential terminal model for upstream
+  # mediators) that are part of the joint model but are not targets.
   y_family <- match.arg(y_family)
-  method <- normalize_b_inference_method(method)
+  method <- zentangler_validate_b_inference(method)
   lambda_choice <- match.arg(lambda_choice)
+  out_p <- empty_p_b_multiview(blocks)
+  out_b <- empty_p_b_multiview(blocks)
+  out_se <- empty_p_b_multiview(blocks)
 
-  if (identical(method, "refit")) {
-    p_b <- infer_p_b_multiview_refit(
-      Y = Y,
-      X = X,
-      blocks = blocks,
-      C = C,
-      coef_by_view = coef_by_view,
-      y_family = y_family
-    )
-    return(list(p_b = p_b, method = "active_set_refit"))
+  if (!identical(method, "debiased")) {
+    return(list(p_b = out_p, b = out_b, se = out_se, method = if (identical(method, "bootstrap")) "bootstrap_b_path" else "none", n_untested = 0L))
   }
 
-  if (identical(method, "bootstrap")) {
-    p_b <- infer_p_b_multiview_refit(
-      Y = Y,
-      X = X,
-      blocks = blocks,
-      C = C,
-      coef_by_view = coef_by_view,
-      y_family = y_family
-    )
-    return(list(p_b = p_b, method = "bootstrap_b_path_initial"))
-  }
-
-  if (identical(y_family, "survival")) {
-    return(debiased_cox_lasso_pvals_multiview(
-      Y = Y,
-      X = X,
-      blocks = blocks,
-      C = C,
-      coef_by_view = coef_by_view,
-      lambda_choice = lambda_choice,
-      max_targets = max_debias_targets
-    ))
-  }
-
-  if (identical(y_family, "gaussian")) {
-    db_try <- try(
-      debiased_lasso_pvals_multiview_gaussian(
-        Y = Y,
-        X = X,
-        blocks = blocks,
-        C = C,
-        coef_by_view = coef_by_view,
-        lambda_choice = lambda_choice,
-        max_targets = max_debias_targets
-      ),
-      silent = TRUE
-    )
-    if (!inherits(db_try, "try-error")) return(db_try)
-
-    msg <- conditionMessage(attr(db_try, "condition"))
-    warning("Debiased-lasso B-path inference failed; returning NA p-values. Reason: ", msg)
-    return(list(
-      p_b = empty_p_b_multiview(blocks),
-      method = paste0("debiased_lasso_gaussian_failed: ", msg)
-    ))
-  }
-
-  if (identical(y_family, "binomial")) {
-    db_try <- try(
-      debiased_lasso_pvals_multiview_logistic(
-        Y = Y,
-        X = X,
-        blocks = blocks,
-        C = C,
-        coef_by_view = coef_by_view,
-        lambda_choice = lambda_choice,
-        max_targets = max_debias_targets
-      ),
-      silent = TRUE
-    )
-    if (!inherits(db_try, "try-error")) return(db_try)
-
-    msg <- conditionMessage(attr(db_try, "condition"))
-    warning("Debiased-logistic-lasso B-path inference failed; returning NA p-values. Reason: ", msg)
-    return(list(
-      p_b = empty_p_b_multiview(blocks),
-      method = paste0("debiased_lasso_logistic_failed: ", msg)
-    ))
-  }
-
-  list(
-    p_b = empty_p_b_multiview(blocks),
-    method = paste0("unsupported_y_family_for_b_inference: ", y_family)
+  pref <- prefix_multiview_blocks(blocks)
+  P <- pref$X
+  if (!is.null(extra_penalized) && ncol(extra_penalized) > 0L) P <- cbind(P, as.matrix(extra_penalized))
+  W <- zentangler_y_design(X, C)
+  db <- try(
+    zentangler_debiased_lasso(
+      Y = Y, W = W, P = P, targets = colnames(pref$X), y_family = y_family,
+      lambda_choice = lambda_choice, max_targets = max_debias_targets,
+      beta_init = beta_init
+    ),
+    silent = TRUE
   )
+  if (inherits(db, "try-error")) {
+    msg <- conditionMessage(attr(db, "condition"))
+    warning("De-biased B-path inference failed; returning NA p-values. Reason: ", msg, call. = FALSE)
+    return(list(p_b = out_p, b = out_b, se = out_se, method = paste0("debiased_failed: ", msg), n_untested = ncol(pref$X)))
+  }
+  if (length(db$dropped) > 0L) {
+    warning(
+      length(db$dropped), " screened mediators exceeded debias_max_targets and were not de-biased; ",
+      "they enter the FDR step with p = 1. Increase debias_max_targets or reduce sis_n.",
+      call. = FALSE
+    )
+  }
+  tab <- db$table
+  for (i in seq_len(nrow(tab))) {
+    hit <- match(tab$name[i], pref$map$design_name)
+    if (is.na(hit)) next
+    view <- pref$map$view[hit]
+    med <- pref$map$mediator[hit]
+    out_p[[view]][med] <- tab$p[i]
+    out_b[[view]][med] <- tab$estimate[i]
+    out_se[[view]][med] <- tab$se[i]
+  }
+  list(p_b = out_p, b = out_b, se = out_se, method = db$method, n_untested = ncol(pref$X) - nrow(tab))
 }
 
-add_mediator_effect_columns <- function(combined, effect_decomposition) {
+add_mediator_effect_columns <- function(combined, effect_decomposition, mediator_effects = NULL) {
+  # Per-mediator indirect effects on the same scale as nie_total. They come
+  # from the post-selection effect model (06-causal-effects.R) and exist only
+  # for mediators in the effect set; other mediators get NA.
   if (is.null(combined) || nrow(combined) == 0) return(combined)
-  delta_x <- suppressWarnings(as.numeric(effect_decomposition$delta_x[1]))
-  if (!is.finite(delta_x)) delta_x <- 1
-  combined$indirect_effect_linear <- combined$score * delta_x
-  combined$abs_indirect_effect_linear <- abs(combined$indirect_effect_linear)
-  if ("nie_total" %in% colnames(effect_decomposition)) {
+  combined$indirect_effect <- NA_real_
+  combined$prop_nie <- NA_real_
+  combined$in_effect_set <- FALSE
+  if (!is.null(mediator_effects) && nrow(mediator_effects) > 0L) {
+    key_tab <- paste(combined$omics, combined$mediator, sep = "::")
+    key_eff <- paste(mediator_effects$omics, mediator_effects$mediator, sep = "::")
+    hit <- match(key_tab, key_eff)
+    ok <- !is.na(hit)
+    combined$indirect_effect[ok] <- mediator_effects$indirect_effect[hit[ok]]
+    combined$in_effect_set[ok] <- TRUE
     total_nie <- suppressWarnings(as.numeric(effect_decomposition$nie_total[1]))
     if (is.finite(total_nie) && abs(total_nie) > 1e-08) {
-      combined$prop_nie_linear <- combined$indirect_effect_linear / total_nie
-    } else {
-      combined$prop_nie_linear <- NA_real_
+      combined$prop_nie[ok] <- combined$indirect_effect[ok] / total_nie
     }
-  } else {
-    combined$prop_nie_linear <- NA_real_
   }
+  combined$abs_indirect_effect <- abs(combined$indirect_effect)
   combined
 }
 
-add_mediator_effect_bootstrap_columns <- function(combined, score_mat, effect_decomposition, ci_level = 0.95) {
-  if (is.null(score_mat) || nrow(score_mat) == 0 || is.null(combined) || nrow(combined) == 0) return(combined)
-  delta_x <- suppressWarnings(as.numeric(effect_decomposition$delta_x[1]))
-  if (!is.finite(delta_x)) return(combined)
-  indirect_mat <- score_mat * delta_x
-  alpha <- 1 - ci_level
-  combined$indirect_effect_boot_mean <- apply(indirect_mat, 2, mean, na.rm = TRUE)
-  combined$indirect_effect_boot_sd <- apply(indirect_mat, 2, stats::sd, na.rm = TRUE)
-  combined$indirect_effect_boot_low <- apply(indirect_mat, 2, stats::quantile, probs = alpha / 2, na.rm = TRUE, names = FALSE)
-  combined$indirect_effect_boot_high <- apply(indirect_mat, 2, stats::quantile, probs = 1 - alpha / 2, na.rm = TRUE, names = FALSE)
-  combined$p_indirect_bootstrap <- bootstrap_score_pvalues(observed = combined$indirect_effect_linear, score_mat = indirect_mat)
-  combined
-}
-
-assemble_mediator_table <- function(screen_tab, b_vec, p_b_vec, fdr_method = c("BH", "BY")) {
+assemble_mediator_table <- function(screen_tab, b_vec, b_fusion_vec, se_b_vec, p_b_vec, fdr_method = c("BH", "BY")) {
   fdr_method <- validate_fdr_method(fdr_method)
-  a_map <- setNames(screen_tab$a_hat, screen_tab$mediator)
-  p_a_map <- setNames(screen_tab$p_a, screen_tab$mediator)
-  q_a_map <- setNames(screen_tab$q_a, screen_tab$mediator)
-  sel_map <- setNames(screen_tab$selected, screen_tab$mediator)
-  med <- names(a_map)
-  selected <- as.logical(sel_map[med])
+  med <- screen_tab$mediator
+  selected <- as.logical(screen_tab$selected)
 
   out <- data.frame(
     mediator = med,
-    a = a_map[med],
-    p_a = p_a_map[med],
-    q_a = q_a_map[med],
-    b = b_vec[med],
-    p_b = p_b_vec[med],
+    a = screen_tab$a_hat,
+    p_a = screen_tab$p_a,
+    q_a = screen_tab$q_a,
+    b = as.numeric(b_vec[med]),
+    se_b = as.numeric(se_b_vec[med]),
+    p_b = as.numeric(p_b_vec[med]),
+    b_fusion = as.numeric(b_fusion_vec[med]),
     selected_by_screen = selected,
     selected_by_sis = selected,
+    selected_by_y_model = is.finite(as.numeric(b_fusion_vec[med])) & as.numeric(b_fusion_vec[med]) != 0,
     stringsAsFactors = FALSE
   )
-
-  out$score <- out$a * out$b
-  out$abs_score <- abs(out$score)
-  both_legs <- is.finite(out$p_a) & is.finite(out$p_b)
-  out$joint_p_ab <- NA_real_
-  out$joint_p_ab[both_legs] <- pmax(out$p_a[both_legs], out$p_b[both_legs])
-  out$p_primary <- out$joint_p_ab
+  out$b[!is.finite(out$b)] <- 0
+  out$b_fusion[!is.finite(out$b_fusion)] <- 0
+  out <- zentangler_finalize_joint_p(out)
   out$q_primary_within_view <- p.adjust(out$p_primary, method = fdr_method)
   out$q_primary <- out$q_primary_within_view
 
   out <- out[order(out$abs_score, decreasing = TRUE), ]
   rownames(out) <- NULL
   out
+}
+
+zentangler_finalize_joint_p <- function(tab) {
+  # Joint-significance (max-P) test of H0: a = 0 or b = 0. Mediators that were
+  # not tested in the B-stage (screened out, or beyond debias_max_targets) get
+  # p_primary = 1 so that FDR is controlled over every tested feature rather
+  # than over the selected subset.
+  tab$score <- tab$a * tab$b
+  tab$abs_score <- abs(tab$score)
+  both <- is.finite(tab$p_a) & is.finite(tab$p_b)
+  tab$joint_p_ab <- NA_real_
+  tab$joint_p_ab[both] <- pmax(tab$p_a[both], tab$p_b[both])
+  tab$p_primary <- tab$joint_p_ab
+  tab$p_primary[!is.finite(tab$p_primary)] <- 1
+  tab$tested_b_stage <- is.finite(tab$p_b)
+  tab
 }

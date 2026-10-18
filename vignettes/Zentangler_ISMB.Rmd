@@ -78,11 +78,19 @@ mae_t1_abc
 
 # Run Zentangler
 
-For a first pass, `late` fusion is a practical choice because it lets each omics
-view keep its own signal structure before combining the view-level predictions.
+`zentangler()` is the main entry point; with the default `model = "parallel"`
+every feature of every view is a candidate mediator. Its default outcome model
+is multiview cooperative learning (`fusion = "multiview"`), whose agreement
+parameter `rho` runs from 0 (early fusion) to 1 (late fusion) and is chosen by
+cross-validation. For a quick first pass, the call below uses the supplementary
+IntegratedLearner-style early fusion (`fusion = "integrated_learner"`,
+`integrated_learner_fusion = "early"`), which stacks the screened mediators
+from all views into one penalized model. B-path p-values are de-biased (`b_inference = "debiased"`) and
+mediator q-values use the composite-null FDR step (`fdr_joint = "hdmt"`) by
+default.
 
 ```{r}
-zt_fit <- fit_multiview_parallel_zentangler(
+zt_fit <- zentangler(
   mae_t1_abc,
   y_var = "Y",
   study_design = "time",
@@ -93,7 +101,8 @@ zt_fit <- fit_multiview_parallel_zentangler(
   screen_method = "sis",
   sis_n = 50,
   sis_rank = "abs_a",
-  fusion_mode = "early",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
   glmnet_alpha = 0.5,
   y_family = "gaussian",
   fdr_method = "BH",
@@ -102,10 +111,12 @@ zt_fit <- fit_multiview_parallel_zentangler(
   seed = 1
 )
 
-zentangler_model_summary(zt_fit)
-zentangler_view_summary(zt_fit, q_threshold = 0.25)
-zentangler_top_mediators(zt_fit, n = 15)
-zentangler_active_mediators(zt_fit, q_threshold = 0.25)
+zt_summary <- summary(zt_fit, q_threshold = 0.25)
+zt_summary$model
+zt_summary$views
+zentangler_mediators(zt_fit, top = 15)
+zentangler_mediators(zt_fit, q_threshold = 0.25)
+zentangler_effects(zt_fit)
 ```
 
 # Run HIMA2 One View At A Time
@@ -227,7 +238,7 @@ head(hima2_tab[order(hima2_tab$q_primary_global), ], 15)
 Use the same ASD slice and compare the top ranked mediators from both methods.
 
 ```{r}
-zt_tab <- zentangler_all_mediators(zt_fit)
+zt_tab <- zentangler_mediators(zt_fit)
 zt_top <- zt_tab[order(zt_tab$q_primary), c("omics", "mediator", "score", "q_primary_global")]
 hima_top <- hima2_tab[order(hima2_tab$q_primary_global), c("view", "mediator", "p_primary", "q_primary_global")]
 
@@ -245,17 +256,21 @@ Interpretation:
 
 # Compare Fusion Strategies
 
-| Fusion mode | Idea | Practical note |
-| --- | --- | --- |
-| `early` | stack selected mediators from all views into one model | easiest to explain |
-| `intermediate` | encourage view-specific models to agree | Gaussian outcomes only |
-| `late` | fit each view first, then combine view-level predictions | helpful when views differ a lot |
+| Label | Arguments | Idea | Practical note |
+| --- | --- | --- | --- |
+| `multiview` | `fusion = "multiview"` | cooperative learning: view-specific coefficients with an agreement parameter `rho` in [0, 1] (0 = early, 1 = late fusion) chosen by cross-validation | default and main engine |
+| `early` | `fusion = "integrated_learner", integrated_learner_fusion = "early"` | stack selected mediators from all views into one model | supplementary; easiest to explain |
+| `late` | `fusion = "integrated_learner", integrated_learner_fusion = "late"` | fit each view first, then combine view-level predictions | supplementary; helpful when views differ a lot |
 
 ```{r}
-fusion_modes <- c("early", "intermediate", "late")
+fusion_settings <- list(
+  multiview = list(fusion = "multiview", integrated_learner_fusion = "late"),
+  early = list(fusion = "integrated_learner", integrated_learner_fusion = "early"),
+  late = list(fusion = "integrated_learner", integrated_learner_fusion = "late")
+)
 
-fusion_fits <- lapply(fusion_modes, function(mode) {
-  fit_multiview_parallel_zentangler(
+fusion_fits <- lapply(fusion_settings, function(fs) {
+  zentangler(
     mae_t1_abc,
     y_var = "Y",
     study_design = "time",
@@ -265,7 +280,8 @@ fusion_fits <- lapply(fusion_modes, function(mode) {
     screen_method = "sis",
     sis_n = 50,
     sis_rank = "abs_a",
-    fusion_mode = mode,
+    fusion = fs$fusion,
+    integrated_learner_fusion = fs$integrated_learner_fusion,
     glmnet_alpha = 0.5,
     y_family = "gaussian",
     fdr_method = "BH",
@@ -275,13 +291,12 @@ fusion_fits <- lapply(fusion_modes, function(mode) {
   )
 })
 
-names(fusion_fits) <- fusion_modes
-
-fusion_summary <- do.call(rbind, lapply(names(fusion_fits), function(mode) {
-  top_tab <- zentangler_top_mediators(fusion_fits[[mode]], n = 5)
+fusion_summary <- do.call(rbind, lapply(names(fusion_fits), function(label) {
+  top_tab <- zentangler_mediators(fusion_fits[[label]], top = 5)
   data.frame(
-    fusion_mode = mode,
-    n_active_q0p25 = nrow(zentangler_active_mediators(fusion_fits[[mode]], q_threshold = 0.25)),
+    fusion = label,
+    rho = fusion_fits[[label]]$settings$rho_used,
+    n_active_q0p25 = nrow(zentangler_mediators(fusion_fits[[label]], q_threshold = 0.25)),
     top_mediators = paste(top_tab$mediator, collapse = "; "),
     stringsAsFactors = FALSE
   )
@@ -297,7 +312,7 @@ ranked by `score`.
 
 ```{r, fig.width=14, fig.height=16, out.width='100%', fig.align='center'}
 zt_sig <- subset(
-  zentangler_all_mediators(zt_fit),
+  zentangler_mediators(zt_fit),
   is.finite(q_primary) & q_primary < 0.25
 )
 

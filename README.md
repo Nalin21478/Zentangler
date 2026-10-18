@@ -1,38 +1,16 @@
 # Zentangler
 
-Zentangler is an R package for **multi-view parallel mediation analysis** with
-`MultiAssayExperiment` input.
-
-It is built for studies where one exposure is connected to many candidate
-mediators measured across several data modalities, and the goal is to rank
-features that may explain the exposure-outcome relationship.
+Zentangler is an R package for **multi-view mediation analysis** with
+`MultiAssayExperiment` input: one exposure, many candidate mediators measured
+across several data modalities (species, KOs, metabolites, transcripts,
+proteins, ...), and one outcome.
 
 ```text
-Exposure X -> mediator M in view k -> outcome Y
+parallel:    X -> M_j (view k) -> Y
+sequential:  X -> M1 -> M2 -> ... -> Mk -> Y
 ```
 
-Examples of views include species, KOs, fecal metabolites, plasma metabolites,
-transcripts, proteins, methylation features, pathway scores, or any other
-numeric assay block.
-
 ![Zentangler mediation framework and workflow](images/zentangler_workflow.png)
-
-## Contents
-
-- [Installation](#installation)
-- [Core Workflow](#core-workflow)
-- [Input Requirements](#input-requirements)
-- [Supported Study Designs](#supported-study-designs)
-- [Supported Outcomes](#supported-outcomes)
-- [Model Components](#model-components)
-- [Fusion Techniques](#fusion-techniques)
-- [B-Stage Inference](#b-stage-inference)
-- [FDR and Active Mediators](#fdr-and-active-mediators)
-- [Bootstrap](#bootstrap)
-- [Sequential Mediation](#sequential-mediation)
-- [Outputs](#outputs)
-- [Simulation Examples](#simulation-examples)
-- [Function Reference](#function-reference)
 
 ## Installation
 
@@ -41,825 +19,338 @@ numeric assay block.
 remotes::install_github("himelmallick/Zentangler")
 ```
 
-## Core Workflow
+Zentangler uses `multiview` (cooperative learning), which needs `glmnet >= 5.0`.
 
-The main function is:
-
-```r
-fit_multiview_parallel_zentangler()
-```
-
-A minimal continuous-outcome run:
+## Quick start
 
 ```r
 library(Zentangler)
 
-fit <- fit_multiview_parallel_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "Y",
-  y_family = "gaussian",
-  method_preset = "fast_lasso",
-  sis_n = 50,
-  fusion_mode = "early",
-  fdr_method = "BH",
-  fdr_scope = "global"
+fit <- zentangler(
+  mae, x_var = "X", y_var = "Y", covariates = "age",
+  transform = c(species = "clr"),   # optional per-view log / CLR transform
+  sis_n = 50
 )
 
-zentangler_top_mediators(fit, n = 10)
-zentangler_view_summary(fit, q_threshold = 0.25)
+fit                                         # short overview
+summary(fit)                                # model, per-view counts, active mediators, effects
+zentangler_mediators(fit, q_threshold = 0.1)   # significant mediators
+zentangler_mediators(fit, top = 20)            # top 20 by |a * b|
+zentangler_effects(fit)                     # NDE, NIE, TE, proportion mediated
 ```
 
-Internally Zentangler does five things:
+## The exported functions
 
-1. Aligns samples across `MultiAssayExperiment` views.
-2. Estimates the A-path for every mediator: `M ~ X + covariates`.
-3. Screens mediators within each view.
-4. Fits a multiview outcome model: `Y ~ X + selected mediators + covariates`.
-5. Scores, ranks, and FDR-adjusts candidate mediators.
+| Function | Purpose |
+| --- | --- |
+| `zentangler()` | main entry point: `model = "parallel"` (default) or `"sequential"` (with `route`) |
+| `fit_multiview_parallel_zentangler()` | the parallel model, with all of its options documented |
+| `fit_sequential_zentangler()` | the sequential model, with all of its options documented |
+| `zentangler_mediators()` | mediator table of a parallel fit (filter by `q_threshold`, `top`, `order_by`) |
+| `zentangler_paths()` | path table of a sequential fit (same filters) |
+| `zentangler_effects()` | one-row causal effect summary (both fit types) |
+| `summary()`, `print()` | methods for both fit classes |
+| `run_negative_controls()` | outcome-permutation negative controls (`model` as in `zentangler()`) |
+| `run_direction_check()` | forward vs reverse hypothesis check (`model` as in `zentangler()`) |
 
-The mediation score is:
+## How a parallel fit works
 
-```text
-score = a * b
-```
+1. **Align** samples across views (`MultiAssayExperiment` sample map) and the
+   phenotype data in `colData(mae)`, optionally log- or CLR-transforming views.
+2. **A-path** for every feature: `M_j ~ X + covariates` (`a_stage_model = "lm"`,
+   or `"maaslin2"` with any MaAsLin2 option, e.g. random effects).
+3. **Screen** the top `sis_n` features per view by standardized `|a|`
+   (`sis_rank = "pvalue"` ranks by p-value; `screen_method = "none"` keeps all).
+4. **Outcome model** `Y ~ X + covariates + screened mediators` with multiview
+   cooperative learning; `rho` (0 = early fusion, 1 = late fusion) and the
+   lasso penalty are tuned by cross-validation.
+5. **B-path inference**: de-biased lasso (default) or full-pipeline bootstrap.
+6. **FDR** for the composite null `a = 0 or b = 0` with an HDMT-style
+   procedure.
+7. **Causal effects** (NDE, NIE, TE) for the significant mediators by
+   g-computation.
 
-where `a` is the exposure-to-mediator coefficient and `b` is the
-mediator-to-outcome coefficient.
+### Input
 
-## Sequential Mediation
+- one experiment per view; assays numeric, features x samples (they are
+  transposed internally);
+- phenotype columns (exposure, outcome, covariates) in `colData(mae)`;
+- samples missing from any analysed view, or with missing phenotype values,
+  are dropped; features with any non-finite value or zero variance are dropped.
 
-The standard Zentangler API is a parallel mediation model:
+### Transformations (log, CLR)
 
-```text
-X -> M_j -> Y
-```
-
-Zentangler separates two model classes:
-
-| Model class | Meaning | API |
-|---|---|---|
-| `parallel` | One or more mediators modeled as `X -> M -> Y` without mediator-to-mediator links | `fit_multiview_parallel_zentangler()` |
-| `sequential` | One explicit ordered route, such as `X -> M1 -> M2 -> Y` | `fit_sequential_zentangler()` |
-
-The k-layer sequential route form is:
-
-```text
-X -> M1 -> M2 -> ... -> Mk -> Y
-```
-
-In this mode, the first mediator layer is screened by `X -> M1`, adjacent
-mediator layers are screened by mediator-to-mediator correlation, retained
-links are refit by regression, and each full path is scored as:
-
-```text
-sequential_score = a * prod(d_links) * b_terminal
-```
-
-Sequential Zentangler now supports only one explicit route through
-`path_templates`. That means one ordered chain and one terminal view. The
-terminal mediator-to-outcome stage is therefore a single-view sparse outcome
-model rather than a cross-view fusion problem.
-
-Example:
+Count and compositional views (taxa, KOs, pathways) are usually analysed on a
+log-ratio scale. `transform` takes `"none"` (default), `"log"` or `"clr"`
+(centered log-ratio: `log(x + pseudocount)` minus each sample's mean log value
+within the view), either once for all views or per view:
 
 ```r
-seq_fit <- fit_sequential_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "Y",
-  path_templates = list(
-    route = c("species", "kos", "fecal_metabolites")
-  ),
-  sis_n = 50,
-  cor_method = "spearman",
-  min_abs_cor = 0.3,
-  cor_q_threshold = 0.25,
-  y_family = "gaussian"
-)
-
-head(zentangler_sequential_paths(seq_fit), 20)
-zentangler_sequential_edges(seq_fit)
-zentangler_sequential_terminals(seq_fit)
-summarize_sequential_zentangler(seq_fit)
+fit <- zentangler(mae, x_var = "X", y_var = "Y",
+                  transform = c(species = "clr", kos = "clr", metabolites = "log"),
+                  pseudocount = c(species = 0.5))   # default: half the smallest positive value
 ```
 
-Sequential fits expose the same kind of result layers as the parallel API:
+CLR and log need non-negative data. The transform is applied to the whole view
+before feature filtering and screening, and is recorded in
+`fit$settings$mae_view_map`. If you also use MaAsLin2, leave its own
+`transform` at `"NONE"` to avoid transforming twice.
 
-| Helper | Returns |
-|---|---|
-| `zentangler_sequential_paths()` | one row per retained complete path |
-| `zentangler_sequential_edges()` | retained adjacent mediator-to-mediator links |
-| `zentangler_sequential_terminals()` | terminal mediator-to-outcome coefficients |
-| `zentangler_sequential_diagnostics()` | sample counts, path counts, terminal selection counts, bootstrap status |
-| `summarize_sequential_zentangler()` | model, threshold, diagnostics, top path, active path, edge, terminal, and causal-effect summaries |
+### MaAsLin2 A-stage
 
-Sequential route discovery still uses correlation screening for adjacent
-mediator layers, followed by regression refits for retained transition-link
-coefficients. Causal effect summaries are added in a second post-selection
-stage, analogous to the parallel API.
-
-The terminal B-stage now supports two public inference modes through
-`b_inference`:
+`a_stage_model = "maaslin2"` runs the A-path with `Maaslin2::Maaslin2()`.
+`maaslin2_args` is passed straight through, so every MaAsLin2 argument is
+available (`random_effects`, `normalization`, `transform`, `analysis_method`,
+`reference`, `min_prevalence`, `output`, ...). Unknown names are rejected.
+Zentangler supplies the data, adds the exposure and covariates to
+`fixed_effects`, and defaults to no normalization or transformation, `"LM"`
+and no prevalence/abundance filtering.
 
 ```r
-b_inference = "debiased"  # de-biased terminal B-stage inference
-b_inference = "bootstrap" # repeated B-stage refits with bootstrap p-values
+fit <- zentangler(mae, x_var = "X", y_var = "Y", covariates = "age",
+                  a_stage_model = "maaslin2",
+                  maaslin2_args = list(random_effects = "SubjectID",
+                                       analysis_method = "LM",
+                                       output = "maaslin2_out"))
 ```
 
-To add sequential causal direct/indirect/total effect summaries, use the
-post-selection causal layer:
+### Outcomes
 
-```r
-causal_inference = "bootstrap"
-```
-
-This computes sequential `effects` / `causal_effects` after route selection and
-adds bootstrap summaries for `nde`, `nie_total`, and `te` when
-`bootstrap_repeats > 0`.
-
-For uncertainty on the complete path score and on the sequential causal-effect
-stage, request a fixed-path bootstrap:
-
-```r
-seq_fit_boot <- fit_sequential_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "Y",
-  path_templates = list(route = c("species", "fecal_metabolites")),
-  sis_n = 50,
-  min_abs_cor = 0.3,
-  cor_q_threshold = 0.25,
-  lambda_choice = "lambda.min",
-  b_inference = "debiased",
-  path_inference = "bootstrap_score",
-  causal_inference = "bootstrap",
-  bootstrap_repeats = 100,
-  y_family = "gaussian"
-)
-```
-
-This adds bootstrap path-score means, intervals, selection frequencies, and
-bootstrap p-values. With `path_inference = "bootstrap_score"`, those bootstrap
-p-values become the final `p_primary` used for path-level q-values. When
-`causal_inference = "bootstrap"`, the fit also stores sequential effect
-bootstrap summaries in `fit$effects`, `fit$causal_effects`, and
-`summarize_sequential_zentangler(fit)$effects`.
-
-For more than two mediator layers, add more views to the single route in
-`path_templates`. For example,
-`list(route_1 = c("species", "kos", "plasma_metabolites"))`
-fits `X -> species -> kos -> plasma_metabolites -> Y`.
-
-Sequential Zentangler now always uses `path_templates`. The route must contain
-at least two modalities. Run additional routes as separate sequential fits, and use
-`fit_multiview_parallel_zentangler()` for pure `X -> M -> Y` mediation.
-
-```r
-seq_route <- fit_sequential_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "Y",
-  path_templates = list(
-    route_1 = c("M1", "M2", "M3") # X -> M1 -> M2 -> M3 -> Y
-  ),
-  sis_n = 50,
-  cor_method = "spearman",
-  min_abs_cor = 0.3,
-  cor_q_threshold = 0.25
-)
-
-head(zentangler_sequential_paths(seq_route), 20)
-```
-
-Sequential route fits also support binary and survival outcomes. For binary
-outcomes, use a numeric 0/1 outcome column and logistic B-stage inference:
-
-```r
-seq_binary <- fit_sequential_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "case_status",
-  path_templates = list(route = c("species", "fecal_metabolites")),
-  sis_n = 50,
-  cor_method = "spearman",
-  min_abs_cor = 0.3,
-  cor_q_threshold = 0.25,
-  lambda_choice = "lambda.min",
-  y_family = "binomial",
-  b_inference = "debiased"
-)
-
-head(zentangler_sequential_paths(seq_binary), 20)
-```
-
-For survival outcomes, provide time and event columns.
-
-```r
-seq_survival <- fit_sequential_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = NULL,
-  path_templates = list(route = c("species", "fecal_metabolites")),
-  sis_n = 50,
-  cor_method = "spearman",
-  min_abs_cor = 0.3,
-  cor_q_threshold = 0.25,
-  lambda_choice = "lambda.min",
-  y_family = "survival",
-  survival_time_var = "time",
-  survival_event_var = "status",
-  b_inference = "debiased"
-)
-
-head(zentangler_sequential_paths(seq_survival), 20)
-```
-
-## Input Requirements
-
-Zentangler expects a `MultiAssayExperiment` where:
-
-- each experiment is one data view
-- assays contain numeric features
-- sample IDs can be aligned through the MAE sample map
-- phenotype/design variables are stored in `colData(mae)`
-
-For `SummarizedExperiment` assays, the usual Bioconductor orientation is:
-
-```text
-features x samples
-```
-
-Zentangler converts each assay internally to:
-
-```text
-samples x features
-```
-
-## Supported Study Designs
-
-Zentangler can either use a numeric exposure directly or create a binary exposure
-from common study designs.
-
-| Design | `study_design` | Exposure used by model |
+| `y_family` | Required columns | Outcome model |
 | --- | --- | --- |
-| Numeric exposure | `"standard"` | `x_var` |
-| Case-control | `"case_control"` | case/control indicator |
-| Time contrast | `"time"` | comparison time vs reference time |
-| Case-control plus time | `"case_control_time"` | case, time, or case-by-time interaction |
+| `"gaussian"` | `y_var` | linear |
+| `"binomial"` | `y_var`, coded 0/1 | logistic |
+| `"survival"` | `survival_time_var`, `survival_event_var` (0/1) | Cox |
 
-### Standard Numeric Exposure
+### Study designs
 
-```r
-fit <- fit_multiview_parallel_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "Y",
-  study_design = "standard"
-)
+`study_design = "standard"` uses a numeric `x_var`. The other designs derive a
+0/1 exposure: `"case_control"` (`case_var`, `case_level`, `control_level`),
+`"time"` (`time_var`, `time_ref`, `time_compare`) and `"case_control_time"`
+(both, with `exposure_role = "case"`, `"time"` or `"interaction"`). Reference
+levels must be given explicitly for character columns, or the column must be a
+factor whose first level is the reference; Zentangler never picks them
+alphabetically.
+
+## Outcome model: multiview cooperative learning
+
+```text
+loss(Y, X g + C d + sum_k M_k b_k)
+  + (rho / 2) * sum_{k<l} || M_k b_k - M_l b_l ||^2  +  lambda * ||b||_1
 ```
 
-### Case-Control
+The outcome model is fitted with the `multiview` package. `rho` runs from 0 to
+1: `rho = 0` is early fusion (one lasso over all views), `rho = 1` is late
+fusion (view-wise fits pushed to agree), and values in between trade the two
+off. Rather than fixing a fusion type, Zentangler chooses `rho` by
+cross-validation over `rho_grid = c(0, 0.2, 0.4, 0.6, 0.8, 1)` on shared folds
+(deviance for binomial/Cox, MSE for Gaussian), then `lambda` by
+`lambda_choice`. The chosen value and the CV table are in
+`fit$settings$rho_used` and `fit$settings$rho_cv`; `rho = 0.5` fixes it.
+Exposure and covariates are unpenalized; the agreement penalty acts on
+covariate-adjusted view contributions. `glmnet_alpha` sets lasso (1) /
+elastic net / ridge (0).
 
-```r
-fit_case <- fit_multiview_parallel_zentangler(
-  mae = mae,
-  y_var = "Y",
-  study_design = "case_control",
-  case_var = "group",
-  control_level = "control",
-  case_level = "case"
-)
-```
-
-### Time-Point Contrast
-
-```r
-fit_time <- fit_multiview_parallel_zentangler(
-  mae = mae,
-  y_var = "Y",
-  study_design = "time",
-  time_var = "visit",
-  time_ref = "T0",
-  time_compare = "T1"
-)
-```
-
-### Case-Control Plus Time
-
-```r
-fit_case_time <- fit_multiview_parallel_zentangler(
-  mae = mae,
-  y_var = "Y",
-  study_design = "case_control_time",
-  case_var = "group",
-  control_level = "control",
-  case_level = "case",
-  time_var = "visit",
-  time_ref = "T0",
-  time_compare = "T1",
-  exposure_role = "interaction",
-  add_design_covariates = TRUE
-)
-```
-
-For `study_design = "case_control_time"`, `exposure_role` can be:
-
-```r
-exposure_role = "case"
-exposure_role = "time"
-exposure_role = "interaction"
-```
-
-## Supported Outcomes
-
-Zentangler supports three outcome families.
-
-| Outcome type | `y_family` | Required inputs | Outcome model |
-| --- | --- | --- | --- |
-| Continuous | `"gaussian"` | `y_var` | Gaussian / linear model |
-| Binary | `"binomial"` | `y_var` | Logistic model |
-| Survival | `"survival"` | `survival_time_var`, `survival_event_var` | Cox model |
-
-### Continuous Outcome
-
-```r
-fit_continuous <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  y_family = "gaussian"
-)
-```
-
-### Binary Outcome
-
-```r
-fit_binary <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  y_family = "binomial",
-  b_inference = "debiased"
-)
-```
-
-`y_var` should be numeric and represent the binary outcome.
-
-### Survival Outcome
-
-```r
-fit_survival <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_family = "survival",
-  survival_time_var = "time",
-  survival_event_var = "status",
-  fusion_mode = "early",
-  b_inference = "debiased"
-)
-```
-
-For survival outcomes:
-
-- `survival_time_var` must be finite and positive.
-- `survival_event_var` must be coded 0/1.
-- Early and late fusion are supported.
-- Intermediate cooperative fusion is currently Gaussian-only.
-
-## Model Components
-
-Zentangler has three main modeling layers:
-
-1. A-stage: exposure-to-mediator models.
-2. Screening: mediator filtering within views.
-3. B/Y-stage: multiview outcome model.
-
-### A-Stage Models
-
-| Option | Description |
-| --- | --- |
-| `a_stage_model = "lm"` | HIMA-like univariate linear A-stage |
-| `a_stage_model = "maaslin2"` | MaAsLin2 A-stage with optional random effects |
-
-Default:
-
-```r
-a_stage_model = "lm"
-```
-
-MaAsLin2 A-stage example:
-
-```r
-fit <- fit_multiview_parallel_zentangler(
-  mae = mae,
-  x_var = "X",
-  y_var = "Y",
-  a_stage_model = "maaslin2",
-  maaslin2_random_effect = "SubjectID",
-  maaslin2_normalization = "NONE",
-  maaslin2_transform = "NONE",
-  maaslin2_analysis_method = "LM"
-)
-```
-
-### Screening
-
-| Option | Description |
-| --- | --- |
-| `screen_method = "sis"` | sure independence screening within each view |
-| `screen_method = "none"` | keep all usable mediators |
-
-Common screening configuration:
-
-```r
-screen_method = "sis"
-sis_n = 50
-sis_rank = "abs_a"   # or "pvalue"
-```
-
-## Fusion Techniques
-
-Fusion controls how selected mediators from multiple views are used in the
-outcome model.
-
-| Fusion | `fusion_mode` | Description | Supported outcomes |
-| --- | --- | --- | --- |
-| Early fusion | `"early"` | concatenate selected mediators from all views into one penalized outcome model | Gaussian, binomial, survival |
-| Intermediate fusion | `"intermediate"` | cooperative learning-style view-specific sparse models with agreement penalty | Gaussian |
-| Late fusion | `"late"` | fit each view separately, then combine view-level predictions | Gaussian, binomial, survival |
-
-### Early Fusion
-
-```r
-fit_early <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  fusion_mode = "early"
-)
-```
-
-Early fusion is often the easiest first model to run and interpret.
-
-### Intermediate Fusion
-
-```r
-fit_intermediate <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  fusion_mode = "intermediate",
-  coop_rho = 0.2
-)
-```
-
-Intermediate fusion uses a cooperative learning-style update. The `coop_rho`
-parameter controls how strongly view-specific fitted signals are encouraged to
-agree.
-
-Higher `coop_rho` means stronger agreement pressure. Lower `coop_rho` means each
-view can behave more independently.
-
-### Late Fusion
-
-```r
-fit_late <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  fusion_mode = "late"
-)
-```
-
-Late fusion is useful when views have very different feature counts or scales.
-
-### Penalization
-
-Early and late fusion use `glmnet`.
-
-```r
-glmnet_alpha = 1    # lasso
-glmnet_alpha = 0.5  # elastic net
-glmnet_alpha = 0    # ridge
-```
-
-Lambda choice:
-
-```r
-lambda_choice = "lambda.1se"  # more conservative
-lambda_choice = "lambda.min"  # less conservative
-```
-
-## B-Stage Inference
-
-B-stage inference controls p-values for the mediator-to-outcome coefficient
-`b`.
-
-| `b_inference` | Best suited for | Notes |
+| `fusion` | Role | Description |
 | --- | --- | --- |
-| `"debiased"` | Gaussian, binary, or survival outcomes | de-biased lasso for Gaussian/binomial and Cox active-set Wald approximation for survival |
-| `"bootstrap"` | Resampling-based uncertainty | requires `bootstrap_repeats > 0` |
+| `"multiview"` (default) | main | cooperative learning with `rho` in [0, 1] tuned by CV |
+| `"integrated_learner"` | supplementary | IntegratedLearner-style fusion: `integrated_learner_fusion = "late"` (per-view models stacked on the link scale with cross-fitted predictions and non-negative weights) or `"early"` (one `glmnet` model over all views) |
 
-Recommended starting points:
+With `multiview` 1.0, Cox fits with `rho > 0` do not converge. Zentangler drops
+non-converged `rho` values with a warning, so survival outcomes currently use
+`rho = 0`.
 
-```r
-# Any supported outcome, analytic sparse B-stage inference
-b_inference = "debiased"
+## B-path inference
 
-# Any supported outcome, slower but resampling-based
-b_inference = "bootstrap"
-```
-
-## FDR and Active Mediators
-
-Zentangler stores both global and within-view FDR results.
-
-| Column | Meaning |
+| `b_inference` | What it does |
 | --- | --- |
-| `q_primary_global` | FDR across all mediators from all views |
-| `q_primary_within_view` | FDR separately inside each view |
-| `q_primary` | selected q-value based on `fdr_scope` |
+| `"debiased"` (default) | one-step de-biasing (de-sparsified lasso) of the fused outcome model, starting from the cooperative fit, for every screened mediator. Gaussian and logistic outcomes use nodewise-lasso de-biasing; Cox outcomes the de-sparsified partial-likelihood estimator. `b` is the de-biased estimate, `b_fusion` the fusion coefficient. |
+| `"bootstrap"` | full-pipeline bootstrap (`bootstrap_repeats > 0`): screening and the outcome model are re-run per replicate; `p_b` inverts the percentile interval of the fusion coefficient, counting non-selection as `b* = 0`. |
 
-Choose the FDR scope:
+## FDR for the mediation null
 
-```r
-fdr_scope = "global"
-fdr_scope = "within_view"
+A mediator is real only if both legs are non-zero, so the null hypothesis is
+composite: `H0: a = 0 or b = 0`. Zentangler offers two ways to control the FDR
+of this joint test.
+
+| `fdr_joint` | Method | Power |
+| --- | --- | --- |
+| `"hdmt"` (default) | Composite-null FDR in the spirit of HDMT (Dai, Stanford & LeBlanc 2020), the procedure used by HIMA2, adapted to the screened design | higher |
+| `"maxp"` | Benjamini-Hochberg / BY on the joint-significance p-value `max(p_a, p_b)` | conservative |
+
+Why `maxp` is conservative: BH on `max(p_a, p_b)` charges every feature as if
+it could be a false discovery at rate `t`. But a feature with `a = 0` can only
+be a false discovery if its `p_a` is small by chance *and* its `p_b` is small,
+and most features are null on both legs (false-discovery rate about `t^2`).
+`"hdmt"` estimates how many features are null on each leg and uses the
+resulting, tighter bound on the expected number of false discoveries:
+
+```text
+E[false discoveries at t] <=  t * #{tested j : p_a,j <= t}                 (b = 0)
+                            + m * pi0_a * gamma * t * F1_b(t)              (a = 0, b != 0)
 ```
 
-Choose the correction method:
+where `pi0_a` is Storey's null proportion of the A-path p-values over all `m`
+features, `F1_b` is the distribution of non-null `p_b` (estimated in the tested
+set), and `gamma` is an upper 90% confidence bound on the share of
+outcome-associated features among exposure-null features, estimated from
+marginal outcome score tests (`p_b_marginal`, one per feature, vectorized).
+Marginal association over-states conditional association, so the bound is
+conservative. Features not tested in the B-stage get `q = 1`.
 
-```r
-fdr_method = "BH"  # Benjamini-Hochberg
-fdr_method = "BY"  # Benjamini-Yekutieli
-```
+Simulation check (n = 250, 500 features in two views, exposure-only and
+outcome-only decoys, nominal FDR 10%, 20-240 replicates per cell):
 
-Inspect active mediators:
+| Scenario | Outcome | `"maxp"` true hits / FDR | `"hdmt"` true hits / FDR |
+| --- | --- | --- | --- |
+| 6 true mediators | Gaussian | 4.9 / 1.5% | 5.7 / 4.7% |
+| 6 true + 50 outcome-only decoys | Gaussian | 0.4 / 0% | 1.3 / 4.9% |
+| no true mediators (global null) | Gaussian | 0 / 0% | 0 / 7.1% |
+| 6 true, no screening | Gaussian | - | 6.0 / 5.0% |
+| 6 true mediators | binomial | 0.1 / 0% | 0.7 / 5.0% |
+| no true mediators | binomial | - | 0 / 6.7% |
 
-```r
-zentangler_active_mediators(fit, q_threshold = 0.25)
-```
+`fdr_method = "BY"` applies to `fdr_joint = "maxp"` and to bootstrap-score
+p-values; the `"hdmt"` step is BH-type. Path-level q-values in sequential fits
+use `max(p_a, p_d, p_b)` with BH/BY.
 
-Evaluate several q thresholds without refitting:
+`fdr_scope = "within_view"` adjusts each view separately.
 
-```r
-summary <- summarize_zentangler(
-  fit,
-  q_threshold = seq(0.05, 0.25, by = 0.05)
-)
+## Causal effects
 
-summary$threshold_summary
-```
+Mediators with `q_primary <= effect_q_threshold` (default 0.25) form the effect
+set. Unpenalized mediator models `M ~ X + C` and the outcome model
+`Y ~ X + C + effect-set mediators` give NDE, NIE and TE by g-computation, on
+the mean-difference (Gaussian), risk-difference (binomial) or conditional
+log-hazard-ratio (survival) scale. Per-mediator `indirect_effect` and
+`prop_nie` are on the same scale as `nie_total`. The default contrast is 0 vs 1
+for a binary exposure and the quartiles otherwise (`effect_x0`, `effect_x1`).
+The models assume no exposure-mediator interaction.
 
 ## Bootstrap
 
-Bootstrap can add uncertainty summaries and can also be used as the B-stage
-inference engine.
+- **Pipeline bootstrap** (`b_inference = "bootstrap"` or
+  `primary_inference = "bootstrap_score"`): screening and the outcome model are
+  re-run in each replicate (`rho` fixed at its full-data CV value). Adds
+  `p_b_bootstrap`, `b_boot_*`, `score_boot_*`, `score_boot_selection_freq` and
+  `p_score_boot`.
+- **Fixed-set effect bootstrap** (`causal_inference = "bootstrap"`): effect
+  set and contrast fixed; effect models refit per replicate. Adds `*_boot_*`
+  intervals and `p_nde_bootstrap`, `p_nie_total_bootstrap`, `p_te_bootstrap`.
+- **Clusters**: `bootstrap_id = "SubjectID"` resamples whole subjects; each
+  copy gets its own label and cross-validation folds keep copies together.
 
 ```r
 fit_boot <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  b_inference = "bootstrap",
-  bootstrap_repeats = 100
+  mae, x_var = "X", y_var = "Y",
+  b_inference = "bootstrap", causal_inference = "bootstrap",
+  bootstrap_repeats = 2000, bootstrap_id = "SubjectID"
 )
 ```
 
-Bootstrap outputs include:
+### How many bootstrap replicates?
 
-- `p_b_bootstrap`
-- `b_boot_mean`
-- `b_boot_sd`
-- `b_boot_low`
-- `b_boot_high`
-- `score_boot_mean`
-- `score_boot_sd`
-- `score_boot_low`
-- `score_boot_high`
-- `score_boot_selection_freq`
+Bootstrap p-values are counts: with `B` replicates the smallest possible
+p-value is `2 / (B + 1)`. A mediator can only reach a q-value of `q` if its
+p-value is small enough for the FDR step, so `B` must grow with the number of
+features `m` and shrink with the expected number of discoveries `k`. A
+practical rule for BH-type thresholds is
 
-For repeated-measures data, resample at the subject level:
+```text
+B  >=  2 * m / (q * k)
+```
+
+| Features `m` | Target `q` | Expected discoveries `k` | Minimum `B` |
+| --- | --- | --- | --- |
+| 300 | 0.10 | 10 | 600 |
+| 1,000 | 0.10 | 10 | 2,000 |
+| 1,000 | 0.05 | 20 | 2,000 |
+| 5,000 | 0.10 | 20 | 5,000 |
+
+With too few replicates every q-value is floored (for example 100 replicates
+and 330 features cannot give any q below about 0.6), so results look null even
+when the signal is strong. `B = 100-200` is enough for confidence intervals of
+the effects (`causal_inference = "bootstrap"`), not for feature-level FDR. For
+feature-level inference with moderate `B`, prefer `b_inference = "debiased"`
+and use the bootstrap for intervals and selection frequencies.
+
+## Sequential mediation
 
 ```r
-fit_cluster_boot <- fit_multiview_parallel_zentangler(
-  mae,
-  x_var = "X",
-  y_var = "Y",
-  bootstrap_repeats = 100,
-  bootstrap_id = "SubjectID"
+seq_fit <- zentangler(
+  mae, model = "sequential", x_var = "X", y_var = "Y",
+  route = c("species", "kos", "fecal_metabolites"),
+  transform = c(species = "clr", kos = "clr"),
+  covariates = "age", sis_n = 50,
+  min_abs_cor = 0.3, cor_q_threshold = 0.25
 )
+
+seq_fit
+zentangler_paths(seq_fit, q_threshold = 0.1)
+seq_fit$edges       # retained mediator-to-mediator links
+seq_fit$terminals   # terminal B-stage
+zentangler_effects(seq_fit)
 ```
 
-## Method Presets
+- **Layer 1** is screened on its A-path.
+- **Transitions** are screened by residual correlation (on `X` and
+  covariates), with FDR over every tested pair, then filtered by
+  `min_abs_cor` and `cor_q_threshold`.
+- **Link coefficients `d`** come from mediator models that condition on `X`,
+  covariates, all retained parents and all upstream ancestors.
+- **Terminal `b`** conditions on `X`, covariates and every retained upstream
+  mediator; the terminal model uses multiview cooperative learning with each
+  route layer as a view (`fusion = "integrated_learner"` for the supplementary
+  fusion), and is de-biased or bootstrapped (`b_inference`).
+- **Path score** `a * prod(d) * b`; path evidence `max(p_a, p_d, p_b)` with
+  BH/BY over all enumerated paths (`path_inference = "bootstrap_score"` uses the
+  pipeline bootstrap of the score instead).
+- **Effects** for the paths at `q <= effect_q_threshold`, by g-computation
+  through the mediator models.
 
-Presets are optional shortcuts for common configurations.
+Only the route's views are used, so samples missing from other experiments are
+kept. Binary and survival outcomes work as in the parallel model.
+
+## Negative controls and direction checks
 
 ```r
-zentangler_method_presets()
+# Outcome permutation (parallel; use model = "sequential", route = c(...) for routes)
+nc <- run_negative_controls(mae, x_var = "X", y_var = "Y", n_perm = 200, sis_n = 50)
+nc$empirical_summary   # permutation p-values for #discoveries, best q, max |score|
+nc$empirical_units     # per-mediator null selection frequency and score p-value
+
+# Forward X -> M -> Y vs reverse Y -> M -> X
+dc <- run_direction_check(mae, forward_x = "X", forward_y = "Y", sis_n = 50)
+dc$summary
+dc$comparison
 ```
 
-| Preset | Description |
+Permutations shuffle the outcome (survival time and event jointly) among the
+analysed samples; they calibrate against the global null of no outcome
+association. Direction checks compare discovery counts and q-values only,
+because forward and reverse scores are in different units.
+
+## Output reference
+
+`zentangler(model = "parallel")` returns a `zentangler_fit` with
+`settings`, `diagnostics`, `mediators`, `views` (per-view screens), `effects`,
+`bootstrap` and, with `return_fits = TRUE`, `model`.
+
+`zentangler(model = "sequential")` returns a `zentangler_sequential_fit` with
+`settings`, `diagnostics`, `paths`, `edges`, `terminals`, `first_layer`,
+`effects` and `bootstrap`.
+
+Main mediator-table columns:
+
+| Column | Meaning |
 | --- | --- |
-| `custom` | preserve user-supplied options |
-| `fast_lasso` | LM A-stage, SIS screening, early-fusion lasso |
-| `elastic_net` | LM A-stage, SIS screening, early-fusion elastic net |
-| `longitudinal_maaslin2` | MaAsLin2 A-stage, SIS screening, early-fusion lasso |
-| `full_exploratory` | LM A-stage, no hard screening, early-fusion elastic net |
-
-## Outputs
-
-The main result table is:
-
-```r
-fit$combined_mediators
-```
-
-or equivalently:
-
-```r
-zentangler_all_mediators(fit)
-```
-
-Important fit object fields:
-
-| Field | Description |
-| --- | --- |
-| `settings` | model settings |
-| `diagnostics` | runtime, sample counts, feature counts, screening counts |
-| `views` | per-view mediator tables |
-| `combined_mediators` | stacked mediator table across all views |
-| `mediators_active` | active mediator table using the default q <= 0.25 |
-| `mediators_top` | top mediators by absolute score |
-| `view_summary` | per-view tested, screened, and active counts |
-| `model_summary` | one-row run summary |
-| `effects` | direct, indirect, total-effect-style summaries plus reduced `X -> Y` total-effect inference |
-| `effect_decomposition` | direct, indirect, total-effect-style summaries plus reduced `X -> Y` total-effect inference |
-| `bootstrap` | bootstrap matrices and failures, if enabled |
-| `fits` | fitted model objects if `return_fits = TRUE` |
-
-Important mediator-table columns:
-
-| Column | Description |
-| --- | --- |
-| `omics` | view name |
-| `mediator` | feature name |
-| `a` | A-path estimate |
-| `p_a`, `q_a` | A-path p-value and q-value |
-| `b`, `p_b` | B-path estimate and p-value |
-| `score` | `a * b` |
-| `abs_score` | absolute score used for ranking |
-| `p_primary` | primary mediator evidence p-value |
-| `q_primary_global` | global FDR q-value |
-| `q_primary_within_view` | within-view FDR q-value |
-| `q_primary` | selected q-value based on `fdr_scope` |
-
-Convenience helpers:
-
-```r
-zentangler_model_summary(fit)
-zentangler_view_summary(fit)
-zentangler_top_mediators(fit, n = 20)
-zentangler_active_mediators(fit, q_threshold = 0.25)
-summarize_zentangler(fit)
-```
-
-## Simulation Examples
-
-Zentangler includes SIMMBA/InterSIM-style simulation helpers. These are useful
-for testing workflows when the true mediators are known.
-
-### Continuous Simulation
-
-```r
-sim <- gen_simmba(
-  nsample = 100,
-  nrep = 1,
-  outcome.type = "continuous",
-  ygen.mode = "LM",
-  seed = 1
-)
-
-fit_continuous <- fit_multiview_parallel_zentangler(
-  sim$trainMae[[1]],
-  x_var = "A",
-  y_var = "Y",
-  y_family = "gaussian",
-  fusion_mode = "early",
-  b_inference = "debiased",
-  sis_n = 50,
-  screen_method = "sis",
-  seed = 1
-)
-
-head(zentangler_all_mediators(fit_continuous))
-```
-
-### Binary Simulation
-
-```r
-sim_binary <- gen_simmba(
-  nsample = 100,
-  nrep = 1,
-  outcome.type = "binary",
-  ygen.mode = "LM",
-  seed = 1
-)
-
-fit_binary <- fit_multiview_parallel_zentangler(
-  sim_binary$trainMae[[1]],
-  x_var = "A",
-  y_var = "Y",
-  y_family = "binomial",
-  fusion_mode = "early",
-  b_inference = "debiased",
-  sis_n = 50,
-  screen_method = "sis",
-  seed = 1
-)
-
-head(zentangler_all_mediators(fit_binary))
-```
-
-### Survival Simulation
-
-```r
-sim_survival <- gen_simmba(
-  nsample = 100,
-  nrep = 1,
-  outcome.type = "survival",
-  ygen.mode = "LM",
-  seed = 1
-)
-
-fit_survival <- fit_multiview_parallel_zentangler(
-  sim_survival$trainMae[[1]],
-  x_var = "A",
-  y_family = "survival",
-  survival_time_var = "time",
-  survival_event_var = "status",
-  fusion_mode = "early",
-  b_inference = "debiased",
-  sis_n = 50,
-  screen_method = "sis",
-  seed = 1
-)
-
-head(zentangler_all_mediators(fit_survival))
-```
-
-### Benchmark Runner
-
-`run_intersim_zentangler()` evaluates recovery across simulation replicates,
-fusion modes, q thresholds, and FDR scopes.
-
-```r
-res <- run_intersim_zentangler(
-  nrep = 10,
-  nsample = 1000,
-  fusion_modes = c("early", "intermediate", "late"),
-  outcome.type = "continuous",
-  screen_method = "sis",
-  sis_n = 200,
-  lambda_choice = "lambda.min",
-  glmnet_alpha = 0.5,
-  fdr_method = "BH",
-  fdr_scope = "both",
-  q_threshold = seq(0.05, 0.25, by = 0.05)
-)
-
-res$summary
-```
-
-Common benchmark metrics:
-
-| Metric | Description |
-| --- | --- |
-| `n_active` | number of active mediators |
-| `true_active` | active mediators that are truly active |
-| `false_active` | active mediators that are false positives |
-| `precision` | true_active / n_active |
-| `recall` | true_active / total true mediators |
-| `fdr` | false_active / n_active |
-| `top50_true` | number of true mediators among the top 50 ranked mediators |
-| `top50_precision` | top50_true / 50 |
-
-## Function Reference
-
-- `fit_multiview_parallel_zentangler()`: fit the multiview mediation model
-- `fit_sequential_zentangler()`: fit k-layer sequential mediation paths
-- `zentangler_sequential_paths()`: return the sequential path table
-- `zentangler_all_mediators()`: return the full mediator table
-- `zentangler_top_mediators()`: return top-ranked mediators
-- `zentangler_active_mediators()`: return active mediators under a q threshold
-- `zentangler_view_summary()`: summarize mediator counts by view
-- `zentangler_model_summary()`: summarize model settings and diagnostics
-- `summarize_zentangler()`: return model, view, threshold, top, and active summaries
-- `zentangler_method_presets()`: inspect named presets
-- `gen_simmba()`: generate simulation data with mediation truth
-- `run_intersim_zentangler()`: run simulation benchmarks
-- `zentangler_truth_key()`: standardize simulation truth tables
-- `zentangler_score_truth_recovery()`: score recovery against simulation truth
-- `zentangler_summarize_truth_recovery()`: summarize recovery across replicates
-- `trigger_InterSIM()`: generate the null InterSIM object used by the simulator
+| `omics`, `mediator` | view and feature |
+| `a`, `p_a`, `q_a` | A-path estimate, p-value, q-value |
+| `b`, `se_b`, `p_b` | B-path estimate, SE and p-value (de-biased, or fusion coefficient under bootstrap) |
+| `b_fusion` | coefficient in the fused outcome model |
+| `p_b_marginal` | marginal outcome score-test p-value (used by `fdr_joint = "hdmt"`) |
+| `score`, `abs_score` | `a * b` and its absolute value |
+| `selected_by_screen`, `selected_by_y_model`, `tested_b_stage` | screen / outcome-model / B-stage status |
+| `p_primary` | joint p-value `max(p_a, p_b)`, 1 if not tested |
+| `q_primary`, `q_primary_global`, `q_primary_within_view` | FDR q-values |
+| `in_effect_set`, `indirect_effect`, `prop_nie` | causal effect stage |

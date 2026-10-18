@@ -11,7 +11,16 @@ Author: Nalin Arora [aut],
     Himel Mallick [aut, cre, cph] (ORCID:
     <https://orcid.org/0000-0003-4956-2429>)
 Maintainer: Himel Mallick <him4004@med.cornell.edu>
-Description: Provides MAE-first tools for generic multi-view mediation analysis. Zentangler estimates exposure-associated mediator paths within each assay view, optionally screens candidate mediators, fits retained mediators jointly using early, intermediate, or late fusion, and ranks candidate mediators using a-path and b-path evidence. The package also includes an experimental k-layer sequential mediation screen based on adjacent mediator-layer correlation screening, plus MultiAssayExperiment simulation utilities for method development.
+Description: Multi-view mediation analysis for MultiAssayExperiment data.
+    Zentangler estimates exposure-to-mediator paths for every feature of every
+    assay view, screens candidate mediators, fits the outcome model with
+    multiview cooperative learning (agreement penalty tuned by
+    cross-validation), de-biases or bootstraps the mediator-to-outcome paths,
+    and controls the false discovery rate of the composite mediation null with
+    an HDMT-style procedure. Causal direct, indirect and total effects are
+    estimated by g-computation. A k-layer sequential route model
+    (X -> M1 -> ... -> Mk -> Y), outcome-permutation negative controls and
+    forward/reverse direction checks are included.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
@@ -19,19 +28,16 @@ Depends:
     R (>= 4.2.0)
 Imports:
     glmnet,
+    multiview,
     MultiAssayExperiment,
     survival,
     SummarizedExperiment,
-    S4Vectors,
     stats,
     utils
 Suggests:
-    InterSIM,
     Maaslin2,
-    splatter,
-    stringr,
-    openxlsx,
     knitr,
     rmarkdown
 VignetteBuilder: knitr
 Config/roxygen2/version: 8.0.0
+RoxygenNote: 7.3.1

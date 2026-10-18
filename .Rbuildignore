@@ -19,3 +19,4 @@
 
 ^zentangler_simmba_results$
 ^zentangler_intersim_.*[.]csv$
+^retired$

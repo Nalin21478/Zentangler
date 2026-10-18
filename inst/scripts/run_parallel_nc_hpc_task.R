@@ -41,6 +41,58 @@ load_mae <- function(mae_file) {
   get("mae", envir = env, inherits = FALSE)
 }
 
+require_coldata_columns <- function(cd, needed, exposure_mode) {
+  missing_needed <- setdiff(needed, colnames(cd))
+  if (length(missing_needed) > 0L) {
+    stop(
+      "Exposure mode '", exposure_mode, "' requires colData columns: ",
+      paste(missing_needed, collapse = ", "),
+      call. = FALSE
+    )
+  }
+}
+
+prepare_mae_exposure <- function(mae, exposure_mode = "existing", x_var = "treatment_any") {
+  exposure_mode <- as.character(exposure_mode[[1L]])
+  cd <- MultiAssayExperiment::colData(mae)
+  keep <- rep(TRUE, nrow(cd))
+  derived_x_var <- x_var
+
+  if (identical(exposure_mode, "existing")) {
+    if (!(x_var %in% colnames(cd))) stop("x_var '", x_var, "' not found in colData.", call. = FALSE)
+  } else if (identical(exposure_mode, "blueberry_any")) {
+    require_coldata_columns(cd, "blueberry_dose_g", exposure_mode)
+    derived_x_var <- ".__zentangler_exposure__"
+    cd[[derived_x_var]] <- as.numeric(cd$blueberry_dose_g > 0)
+  } else if (identical(exposure_mode, "blueberry_dose")) {
+    require_coldata_columns(cd, "blueberry_dose_g", exposure_mode)
+    derived_x_var <- ".__zentangler_exposure__"
+    cd[[derived_x_var]] <- as.numeric(cd$blueberry_dose_g)
+  } else if (identical(exposure_mode, "Y_vs_Z")) {
+    require_coldata_columns(cd, "group", exposure_mode)
+    keep <- as.character(cd$group) %in% c("Y", "Z")
+    derived_x_var <- ".__zentangler_exposure__"
+    cd[[derived_x_var]] <- ifelse(as.character(cd$group) == "Y", 1, ifelse(as.character(cd$group) == "Z", 0, NA_real_))
+  } else if (identical(exposure_mode, "Y_vs_X")) {
+    require_coldata_columns(cd, "group", exposure_mode)
+    keep <- as.character(cd$group) %in% c("Y", "X")
+    derived_x_var <- ".__zentangler_exposure__"
+    cd[[derived_x_var]] <- ifelse(as.character(cd$group) == "Y", 1, ifelse(as.character(cd$group) == "X", 0, NA_real_))
+  } else {
+    stop(
+      "Unsupported exposure mode: ", exposure_mode, ". ",
+      "Use one of: existing, blueberry_any, blueberry_dose, Y_vs_Z, Y_vs_X",
+      call. = FALSE
+    )
+  }
+
+  MultiAssayExperiment::colData(mae) <- cd
+  list(
+    mae = mae[, keep],
+    x_var = derived_x_var
+  )
+}
+
 write_if_nonempty <- function(x, file) {
   if (is.null(x)) return(invisible(FALSE))
   if (is.data.frame(x) && nrow(x) == 0L) return(invisible(FALSE))
@@ -74,6 +126,21 @@ if (!is.finite(task_id) || task_id < 1L || task_id > nrow(grid)) {
 row <- grid[task_id, , drop = FALSE]
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
+# Map a fusion label to the zentangler outcome-model arguments:
+#   "multiview" (default; cooperative learning, rho in [0, 1] tuned by CV)
+#   "early" / "late" (supplementary IntegratedLearner-style fusion)
+# The legacy grid value "intermediate" is read as "multiview".
+fusion_args <- function(label) {
+  label <- as.character(label)[1]
+  if (label %in% c("multiview", "intermediate", "cooperative")) {
+    return(list(fusion = "multiview", integrated_learner_fusion = "late"))
+  }
+  if (label %in% c("early", "late")) {
+    return(list(fusion = "integrated_learner", integrated_learner_fusion = label))
+  }
+  stop("Unknown fusion label: ", label, call. = FALSE)
+}
+
 suppressPackageStartupMessages({
   library(Zentangler)
   library(MultiAssayExperiment)
@@ -81,7 +148,11 @@ suppressPackageStartupMessages({
 
 mae_name <- as.character(row_value(row, "mae"))
 mae_file <- as.character(row_value(row, "mae_file"))
+exposure_mode <- as.character(row_value(row, "exposure_mode", "existing"))
+# The grid keeps its fusion_mode column (early / late / multiview) so existing
+# CSVs still work; it is translated to fusion / integrated_learner_fusion here.
 fusion_mode <- as.character(row_value(row, "fusion_mode"))
+fusion_settings <- fusion_args(fusion_mode)
 sis_n <- as.integer(row_value(row, "sis_n"))
 glmnet_alpha <- as.numeric(row_value(row, "glmnet_alpha"))
 outcome <- as.character(row_value(row, "outcome"))
@@ -89,17 +160,18 @@ n_active_mediators <- as.integer(row_value(row, "n_active_mediators", NA))
 x_var <- as.character(row_value(row, "x_var", "treatment_any"))
 y_family <- as.character(row_value(row, "y_family", "gaussian"))
 covars <- split_arg(row_value(row, "covariates", ""))
-method_preset <- as.character(row_value(row, "method_preset", "custom"))
+a_stage_model <- as.character(row_value(row, "a_stage_model", "lm"))
 screen_method <- as.character(row_value(row, "screen_method", "sis"))
 lambda_choice <- as.character(row_value(row, "lambda_choice", "lambda.min"))
-b_inference <- as.character(row_value(row, "b_inference", "debiased_lasso"))
+b_inference <- as.character(row_value(row, "b_inference", "debiased"))
 fdr_method <- as.character(row_value(row, "fdr_method", "BH"))
 fdr_scope <- as.character(row_value(row, "fdr_scope", "global"))
 
 tag <- sprintf(
-  "job%04d_%s_%s_sis%s_alpha%s_%s_perm%s",
+  "job%04d_%s_%s_%s_sis%s_alpha%s_%s_perm%s",
   as.integer(row_value(row, "job_id", task_id)),
   safe_tag(mae_name),
+  safe_tag(exposure_mode),
   safe_tag(fusion_mode),
   safe_tag(sis_n),
   gsub("\\.", "p", as.character(glmnet_alpha)),
@@ -113,7 +185,6 @@ out_null <- file.path(out_dir, paste0(tag, "_null_summaries.csv"))
 out_observed <- file.path(out_dir, paste0(tag, "_observed_summary.csv"))
 out_mediators <- file.path(out_dir, paste0(tag, "_observed_mediators_active.csv"))
 out_empirical_mediators <- file.path(out_dir, paste0(tag, "_empirical_mediator_summary.csv"))
-out_null_mediators <- file.path(out_dir, paste0(tag, "_null_mediator_summaries.csv"))
 out_grid_row <- file.path(out_dir, paste0(tag, "_grid_row.csv"))
 out_session <- file.path(out_dir, paste0(tag, "_sessionInfo.txt"))
 
@@ -121,25 +192,28 @@ cat("Running generic parallel negative-control task\n")
 cat("Task:", task_id, "of", nrow(grid), "\n")
 print(row)
 
-mae_obj <- load_mae(mae_file)
+mae_obj0 <- load_mae(mae_file)
+prepared <- prepare_mae_exposure(mae_obj0, exposure_mode = exposure_mode, x_var = x_var)
+mae_obj <- prepared$mae
 utils::write.csv(row, out_grid_row, row.names = FALSE)
 writeLines(capture.output(sessionInfo()), out_session)
 
-fit <- run_parallel_negative_controls(
+fit <- run_negative_controls(
   mae = mae_obj,
-  x_var = x_var,
+  x_var = prepared$x_var,
   y_var = outcome,
   n_perm = n_perm,
   q_threshold = q_threshold,
   seed = seed,
   y_family = y_family,
   covariates = covars,
-  method_preset = method_preset,
+  a_stage_model = a_stage_model,
   screen_method = screen_method,
   sis_n = sis_n,
   glmnet_alpha = glmnet_alpha,
   lambda_choice = lambda_choice,
-  fusion_mode = fusion_mode,
+  fusion = fusion_settings$fusion,
+  integrated_learner_fusion = fusion_settings$integrated_learner_fusion,
   b_inference = b_inference,
   fdr_method = fdr_method,
   fdr_scope = fdr_scope
@@ -149,9 +223,10 @@ saveRDS(fit, out_rds)
 write_if_nonempty(fit$empirical_summary, out_summary)
 write_if_nonempty(fit$null_summaries, out_null)
 write_if_nonempty(fit$observed_summary, out_observed)
-write_if_nonempty(fit$observed_fit$mediators_active, out_mediators)
-write_if_nonempty(fit$empirical_mediator_summary, out_empirical_mediators)
-write_if_nonempty(fit$null_mediator_summaries, out_null_mediators)
+write_if_nonempty(zentangler_mediators(fit$observed_fit, q_threshold = q_threshold), out_mediators)
+write_if_nonempty(fit$empirical_units, out_empirical_mediators)
+# Per-permutation null mediator tables are no longer returned; per-mediator null
+# frequencies and p-values are in fit$empirical_units (written above).
 
 cat("Saved RDS:", out_rds, "\n")
 cat("Observed active mediators:", n_active_mediators, "\n")

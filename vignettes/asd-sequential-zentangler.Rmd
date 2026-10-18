@@ -18,11 +18,17 @@ knitr::opts_chunk$set(
 
 # Overview
 
-This tutorial runs the two Zentangler mediation APIs on the ASD multi-omics
-example data:
+This tutorial runs the two Zentangler mediation models on the ASD multi-omics
+example data, both through the main entry point `zentangler()`:
 
-1. `fit_multiview_parallel_zentangler()` for pure parallel mediation.
-2. `fit_sequential_zentangler()` for one explicit sequential route.
+1. `zentangler(mae, x_var = ..., y_var = ...)` (default `model = "parallel"`)
+   for pure parallel mediation.
+2. `zentangler(mae, model = "sequential", x_var = ..., y_var = ..., route = c(...))`
+   for one explicit sequential route.
+
+These dispatch to `fit_multiview_parallel_zentangler()` and
+`fit_sequential_zentangler()`, which can also be called directly and whose help
+pages list every option.
 
 The ASD example uses a time contrast as the exposure:
 
@@ -84,16 +90,20 @@ The parallel API treats all selected mediators as candidate routes of the form:
 X -> mediator -> Y
 ```
 
-There are no mediator-to-mediator links in this model.
+There are no mediator-to-mediator links in this model. The default outcome
+model is multiview cooperative learning (`fusion = "multiview"`), whose
+agreement parameter `rho` runs from 0 (early fusion) to 1 (late fusion) and is
+chosen by cross-validation; this quick tutorial run uses the supplementary
+IntegratedLearner-style early fusion.
 
 ```{r}
-parallel_fit <- fit_multiview_parallel_zentangler(
+parallel_fit <- zentangler(
   mae_t1_abc,
   x_var = "X",
   y_var = "Y",
-  method_preset = "fast_lasso",
   sis_n = 25,
-  fusion_mode = "early",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
   y_family = "gaussian",
   fdr_method = "BH",
   fdr_scope = "global",
@@ -101,9 +111,10 @@ parallel_fit <- fit_multiview_parallel_zentangler(
   seed = 1
 )
 
-zentangler_model_summary(parallel_fit)
-zentangler_view_summary(parallel_fit, q_threshold = 0.25)
-head(zentangler_top_mediators(parallel_fit, n = 10))
+parallel_summary <- summary(parallel_fit, q_threshold = 0.25)
+parallel_summary$model
+parallel_summary$views
+zentangler_mediators(parallel_fit, top = 10)
 ```
 
 # 2. One Sequential Route
@@ -116,32 +127,38 @@ X -> species -> fecal_metabolites -> Y
 
 The first layer is screened by exposure association. Adjacent layers are
 screened by mediator-to-mediator correlation, and retained links are refit by
-regression.
+regression. The route is passed as an ordered character vector of view names
+(`route`). The terminal outcome model uses multiview cooperative learning by
+default (`fusion = "multiview"`, each route layer is one view, `rho` in
+\[0, 1\] chosen by cross-validation); IntegratedLearner-style early fusion
+(`fusion = "integrated_learner"`, `integrated_learner_fusion = "early"`) is the
+supplementary single-model alternative and is used below to keep the tutorial
+fast.
 
 ```{r}
-sequential_fit <- fit_sequential_zentangler(
+sequential_fit <- zentangler(
   mae_t1_abc,
+  model = "sequential",
   x_var = "X",
   y_var = "Y",
-  path_templates = list(
-    species_to_fecal = c("species", "fecal_metabolites")
-  ),
+  route = c("species", "fecal_metabolites"),
   sis_n = 25,
   cor_method = "spearman",
   min_abs_cor = 0.15,
   cor_q_threshold = 0.5,
-  fusion_mode = "late",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
   lambda_choice = "lambda.min",
   y_family = "gaussian",
   seed = 1
 )
 
-sequential_paths <- zentangler_sequential_paths(sequential_fit)
-sequential_fit$settings$route_set_type
-head(sequential_paths, 20)
-summarize_sequential_zentangler(sequential_fit)$model_summary
-head(zentangler_sequential_edges(sequential_fit), 20)
-head(zentangler_sequential_terminals(sequential_fit), 20)
+species_fecal_paths <- zentangler_paths(sequential_fit)
+sequential_fit$settings$route
+head(species_fecal_paths, 20)
+summary(sequential_fit)$model
+head(sequential_fit$edges, 20)
+head(sequential_fit$terminals, 20)
 zentangler_effects(sequential_fit)
 ```
 
@@ -163,19 +180,20 @@ run_asd_sequential_route <- function(route_name, route_views, sis_n = 25) {
     mae_t1_abc,
     x_var = "X",
     y_var = "Y",
-    path_templates = stats::setNames(list(route_views), route_name),
+    route = route_views,
     sis_n = sis_n,
     cor_method = "spearman",
     min_abs_cor = 0.15,
     cor_q_threshold = 0.5,
-    fusion_mode = "late",
+    fusion = "integrated_learner",
+    integrated_learner_fusion = "early",
     lambda_choice = "lambda.min",
     glmnet_alpha = 0.5,
     y_family = "gaussian",
     seed = 1
   )
 
-  paths <- zentangler_sequential_paths(fit)
+  paths <- zentangler_paths(fit)
   if (nrow(paths) > 0) {
     paths$route_name <- route_name
     paths$view_route <- paste(route_views, collapse = " -> ")
@@ -189,7 +207,7 @@ run_asd_sequential_route <- function(route_name, route_views, sis_n = 25) {
   list(
     fit = fit,
     paths = paths,
-    model_summary = summarize_sequential_zentangler(fit)$model_summary
+    model = summary(fit)$model
   )
 }
 ```
@@ -215,10 +233,10 @@ asd_route_fits <- Map(
   asd_route_scenarios
 )
 
-route_model_summaries <- do.call(
+route_models <- do.call(
   rbind,
   lapply(names(asd_route_fits), function(route_name) {
-    out <- asd_route_fits[[route_name]]$model_summary
+    out <- asd_route_fits[[route_name]]$model
     out$route_name <- route_name
     out$view_route <- paste(asd_route_scenarios[[route_name]], collapse = " -> ")
     out[, c("route_name", "view_route", setdiff(names(out), c("route_name", "view_route"))), drop = FALSE]
@@ -231,7 +249,7 @@ route_path_list <- Filter(
 )
 route_paths <- if (length(route_path_list) > 0) do.call(rbind, route_path_list) else data.frame()
 
-route_model_summaries
+route_models
 if (nrow(route_paths) > 0) {
   head(route_paths[order(route_paths$q_primary, route_paths$p_primary), ], 20)
 } else {
@@ -239,43 +257,10 @@ if (nrow(route_paths) > 0) {
 }
 ```
 
-You can also define broader sequential layers instead of one named view per
-layer. This example treats `species` and `kos` as a microbiome layer and fecal
-and plasma metabolites as a metabolite layer. The runnable example below uses
-late fusion. If the retained terminal mediators span both metabolite views, you
-can switch `fusion_mode` to `"intermediate"` to try the cooperative terminal
-fusion mode.
-
-```{r}
-grouped_layer_fit <- fit_sequential_zentangler(
-  mae_t1_abc,
-  x_var = "X",
-  y_var = "Y",
-  stage_views = list(
-    microbiome = c("species", "kos"),
-    metabolites = c("fecal_metabolites", "plasma_metabolites")
-  ),
-  sis_n = 12,
-  cor_method = "spearman",
-  min_abs_cor = 0.15,
-  cor_q_threshold = 0.75,
-  fusion_mode = "late",
-  lambda_choice = "lambda.min",
-  glmnet_alpha = 0.5,
-  coop_rho = 0.2,
-  y_family = "gaussian",
-  seed = 1
-)
-
-grouped_layer_paths <- zentangler_sequential_paths(grouped_layer_fit)
-summarize_sequential_zentangler(grouped_layer_fit)$model_summary
-if (nrow(grouped_layer_paths) > 0) {
-  table(grouped_layer_paths$terminal_view)
-  head(grouped_layer_paths[order(grouped_layer_paths$q_primary, grouped_layer_paths$p_primary), ], 20)
-} else {
-  grouped_layer_paths
-}
-```
+Each layer of a route is one view of the MAE. To treat several views as one
+biological layer (for example `species` and `kos` as a microbiome layer), combine
+their features into a single experiment before building the MAE, and then use
+that experiment as one element of `route`.
 
 # 4. Sequential Diagnostics and Bootstrap
 
@@ -284,10 +269,14 @@ complete paths, retained mediator-to-mediator edges, terminal B-stage effects,
 post-selection causal-effect summaries, and run diagnostics.
 
 ```{r}
-zentangler_sequential_diagnostics(sequential_fit)
+sequential_fit$diagnostics
 ```
 
-For uncertainty on the full path score, use the fixed-path bootstrap. Increase
+For uncertainty on the full path score, use `path_inference = "bootstrap_score"`:
+every replicate re-runs route discovery, and the path p-value is the sign-based
+bootstrap p-value of the path score. `causal_inference = "bootstrap"` adds
+bootstrap intervals to the causal effects of the fixed set of significant
+paths. Increase
 `bootstrap_repeats` for real analysis; the small value below is only for a quick
 tutorial run.
 
@@ -296,14 +285,13 @@ sequential_boot_fit <- fit_sequential_zentangler(
   mae_t1_abc,
   x_var = "X",
   y_var = "Y",
-  path_templates = list(
-    species_to_fecal = c("species", "fecal_metabolites")
-  ),
+  route = c("species", "fecal_metabolites"),
   sis_n = 12,
   cor_method = "spearman",
   min_abs_cor = 0.15,
   cor_q_threshold = 0.75,
-  fusion_mode = "early",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
   lambda_choice = "lambda.min",
   b_inference = "debiased",
   path_inference = "bootstrap_score",
@@ -313,7 +301,7 @@ sequential_boot_fit <- fit_sequential_zentangler(
   seed = 1
 )
 
-head(zentangler_sequential_paths(sequential_boot_fit), 20)
+head(zentangler_paths(sequential_boot_fit), 20)
 zentangler_effects(sequential_boot_fit)
 ```
 
@@ -324,19 +312,19 @@ out_dir <- file.path("tutorial_results", "asd_sequential_zentangler")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 write.csv(
-  zentangler_all_mediators(parallel_fit),
+  zentangler_mediators(parallel_fit),
   file.path(out_dir, "parallel_all_mediators.csv"),
   row.names = FALSE
 )
 
 write.csv(
-  sequential_paths,
+  species_fecal_paths,
   file.path(out_dir, "sequential_species_to_fecal_paths.csv"),
   row.names = FALSE
 )
 
 write.csv(
-  route_model_summaries,
+  route_models,
   file.path(out_dir, "sequential_route_scenario_model_summaries.csv"),
   row.names = FALSE
 )
@@ -347,18 +335,11 @@ write.csv(
   row.names = FALSE
 )
 
-write.csv(
-  grouped_layer_paths,
-  file.path(out_dir, "sequential_grouped_microbiome_to_metabolite_paths.csv"),
-  row.names = FALSE
-)
-
 saveRDS(
   list(
     parallel_fit = parallel_fit,
     sequential_fit = sequential_fit,
     asd_route_fits = asd_route_fits,
-    grouped_layer_fit = grouped_layer_fit,
     sequential_boot_fit = sequential_boot_fit
   ),
   file.path(out_dir, "asd_sequential_zentangler_fits.rds")
@@ -371,23 +352,28 @@ For sequential route fits, the main path table includes:
 
 | Column | Meaning |
 |---|---|
-| `route_set_type` | `sequential` |
+| `route_type` | `sequential` |
 | `mediator_path` | feature-level mediator path |
 | `a` | exposure-to-first-mediator coefficient |
 | `d_product` | product of mediator-to-mediator link coefficients |
 | `b` | terminal mediator-to-outcome coefficient |
 | `sequential_score` | `a * d_product * b` |
-| `fusion_mode` | terminal fusion mode: `early`, `intermediate`, or `late` |
 | `p_primary` | conservative path-level screening p-value |
 | `q_primary` | global FDR-adjusted path-level value |
+| `in_effect_set` | path enters the causal-effect stage (`q_primary <= effect_q_threshold`) |
 
-Sequential fits now also expose a post-selection causal-effect layer through
-`sequential_fit$effects`, `sequential_fit$causal_effects`, and
-`summarize_sequential_zentangler(sequential_fit)$effects`.
+The terminal outcome model of the fit is stored in `summary(sequential_fit)$model`
+(`fusion`, and the chosen `rho` for the multiview model). Use
+`zentangler_paths(sequential_fit, q_threshold = 0.25)` for the active paths and
+`zentangler_paths(sequential_fit, top = 20)` for the top-ranked paths.
+
+Sequential fits also expose a post-selection causal-effect layer through
+`sequential_fit$effects`, `zentangler_effects(sequential_fit)`, and
+`summary(sequential_fit)$effects`.
 
 For the pure parallel model, use the usual Zentangler helpers:
 
 ```{r}
-head(zentangler_all_mediators(parallel_fit))
-zentangler_threshold_summary(parallel_fit, q_threshold = seq(0.05, 0.25, by = 0.05))
+head(zentangler_mediators(parallel_fit))
+summary(parallel_fit, q_threshold = seq(0.05, 0.25, by = 0.05))$thresholds
 ```

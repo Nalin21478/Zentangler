@@ -90,13 +90,31 @@ if (!is.finite(task_id) || task_id < 1L || task_id > nrow(grid)) {
 row <- grid[task_id, , drop = FALSE]
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
+# Map a fusion label to the zentangler outcome-model arguments:
+#   "multiview" (default; cooperative learning, rho in [0, 1] tuned by CV)
+#   "early" / "late" (supplementary IntegratedLearner-style fusion)
+# The legacy grid value "intermediate" is read as "multiview".
+fusion_args <- function(label) {
+  label <- as.character(label)[1]
+  if (label %in% c("multiview", "intermediate", "cooperative")) {
+    return(list(fusion = "multiview", integrated_learner_fusion = "late"))
+  }
+  if (label %in% c("early", "late")) {
+    return(list(fusion = "integrated_learner", integrated_learner_fusion = label))
+  }
+  stop("Unknown fusion label: ", label, call. = FALSE)
+}
+
 suppressPackageStartupMessages({
   library(Zentangler)
   library(MultiAssayExperiment)
 })
 
 mae_name <- as.character(row_value(row, "mae"))
+# The grid keeps its fusion_mode column (early / late / multiview) so existing
+# CSVs still work; it is translated to fusion / integrated_learner_fusion here.
 fusion_mode <- as.character(row_value(row, "fusion_mode"))
+fusion_settings <- fusion_args(fusion_mode)
 sis_n <- as.integer(row_value(row, "sis_n"))
 glmnet_alpha <- as.numeric(row_value(row, "glmnet_alpha"))
 outcome <- as.character(row_value(row, "outcome"))
@@ -128,7 +146,6 @@ out_null <- file.path(out_dir, paste0(tag, "_null_summaries.csv"))
 out_observed <- file.path(out_dir, paste0(tag, "_observed_summary.csv"))
 out_mediators <- file.path(out_dir, paste0(tag, "_observed_mediators_active.csv"))
 out_empirical_mediators <- file.path(out_dir, paste0(tag, "_empirical_mediator_summary.csv"))
-out_null_mediators <- file.path(out_dir, paste0(tag, "_null_mediator_summaries.csv"))
 out_grid_row <- file.path(out_dir, paste0(tag, "_grid_row.csv"))
 out_session <- file.path(out_dir, paste0(tag, "_sessionInfo.txt"))
 
@@ -140,7 +157,7 @@ mae_obj <- load_blueberry_mae(mae_name = mae_name, mae_dir = mae_dir)
 utils::write.csv(row, out_grid_row, row.names = FALSE)
 writeLines(capture.output(sessionInfo()), out_session)
 
-fit <- run_parallel_negative_controls(
+fit <- run_negative_controls(
   mae = mae_obj,
   x_var = "treatment_any",
   y_var = outcome,
@@ -149,13 +166,13 @@ fit <- run_parallel_negative_controls(
   seed = seed,
   y_family = "gaussian",
   covariates = covars,
-  method_preset = "custom",
   screen_method = "sis",
   sis_n = sis_n,
   glmnet_alpha = glmnet_alpha,
   lambda_choice = "lambda.min",
-  fusion_mode = fusion_mode,
-  b_inference = "debiased_lasso",
+  fusion = fusion_settings$fusion,
+  integrated_learner_fusion = fusion_settings$integrated_learner_fusion,
+  b_inference = "debiased",
   fdr_method = "BH",
   fdr_scope = "global"
 )
@@ -164,9 +181,10 @@ saveRDS(fit, out_rds)
 write_if_nonempty(fit$empirical_summary, out_summary)
 write_if_nonempty(fit$null_summaries, out_null)
 write_if_nonempty(fit$observed_summary, out_observed)
-write_if_nonempty(fit$observed_fit$mediators_active, out_mediators)
-write_if_nonempty(fit$empirical_mediator_summary, out_empirical_mediators)
-write_if_nonempty(fit$null_mediator_summaries, out_null_mediators)
+write_if_nonempty(zentangler_mediators(fit$observed_fit, q_threshold = q_threshold), out_mediators)
+write_if_nonempty(fit$empirical_units, out_empirical_mediators)
+# Per-permutation null mediator tables are no longer returned; per-mediator null
+# frequencies and p-values are in fit$empirical_units (written above).
 
 cat("Saved RDS:", out_rds, "\n")
 cat("Observed active mediators:", n_active_mediators, "\n")

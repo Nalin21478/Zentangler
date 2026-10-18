@@ -49,10 +49,25 @@ secondary_change_outcomes <- c(
 
 all_outcomes <- c(secondary_change_outcomes)
 
+# Map a fusion label to the zentangler outcome-model arguments:
+#   "multiview" (default; cooperative learning, rho in [0, 1] tuned by CV)
+#   "early" / "late" (supplementary IntegratedLearner-style fusion)
+fusion_args <- function(label) {
+  label <- as.character(label)[1]
+  if (identical(label, "multiview")) {
+    return(list(fusion = "multiview", integrated_learner_fusion = "late"))
+  }
+  if (label %in% c("early", "late")) {
+    return(list(fusion = "integrated_learner", integrated_learner_fusion = label))
+  }
+  stop("Unknown fusion label: ", label, call. = FALSE)
+}
+
 # -----------------------------
 # Parallel Zentangler helper
 # -----------------------------
-run_parallel_blueberry <- function(mae, outcome, fusion_mode = "early") {
+run_parallel_blueberry <- function(mae, outcome, fusion_label = "early") {
+  fa <- fusion_args(fusion_label)
   outcome_covars <- covars
   if (identical(outcome, "cGMP_month6")) {
     outcome_covars <- c("cGMP_baseline", outcome_covars)
@@ -64,13 +79,13 @@ run_parallel_blueberry <- function(mae, outcome, fusion_mode = "early") {
     y_var = outcome,
     y_family = "gaussian",
     covariates = outcome_covars,
-    method_preset = "custom",
     screen_method = "sis",
     sis_n = 25,
     glmnet_alpha = 0.5,
     lambda_choice = "lambda.min",
-    fusion_mode = fusion_mode,
-    b_inference = "debiased_lasso",
+    fusion = fa$fusion,
+    integrated_learner_fusion = fa$integrated_learner_fusion,
+    b_inference = "debiased",
     fdr_method = "BH",
     fdr_scope = "global"
   )
@@ -85,18 +100,18 @@ mae_list <- list(
   all_omics = mae_all
 )
 
-fusion_modes <- c("early", "late")
+fusion_labels <- c("early", "late")
 
 parallel_fits <- list()
 
 for (mae_name in names(mae_list)) {
   parallel_fits[[mae_name]] <- list()
-  for (fusion in fusion_modes) {
+  for (fusion in fusion_labels) {
     parallel_fits[[mae_name]][[fusion]] <- lapply(all_outcomes, function(outcome) {
       run_parallel_blueberry(
         mae = mae_list[[mae_name]],
         outcome = outcome,
-        fusion_mode = fusion
+        fusion_label = fusion
       )
     })
     names(parallel_fits[[mae_name]][[fusion]]) <- all_outcomes
@@ -104,9 +119,9 @@ for (mae_name in names(mae_list)) {
 }
 
 # Example:
-# parallel_fits[["all_omics"]][["early"]][["Trigl_change"]][["mediators_active"]]
-# zentangler_top_mediators(parallel_fits[["pathways"]][["early"]][["cGMP_change"]], n = 20)
-# zentangler_view_summary(parallel_fits[["ecs"]][["late"]][["IL6_pg_ml20_change"]], q_threshold = 0.25)
+# zentangler_mediators(parallel_fits[["all_omics"]][["early"]][["Trigl_change"]], q_threshold = 0.25)
+# zentangler_mediators(parallel_fits[["pathways"]][["early"]][["cGMP_change"]], top = 20)
+# summary(parallel_fits[["ecs"]][["late"]][["IL6_pg_ml20_change"]], q_threshold = 0.25)$views
 
 # -----------------------------
 # Sequential Zentangler helper
@@ -115,8 +130,9 @@ run_sequential_blueberry <- function(
     mae,
     outcome,
     path_template,
-    fusion_mode = "early"
+    fusion_label = "early"
 ) {
+  fa <- fusion_args(fusion_label)
   outcome_covars <- covars
   if (identical(outcome, "cGMP_month6")) {
     outcome_covars <- c("cGMP_baseline", outcome_covars)
@@ -126,17 +142,18 @@ run_sequential_blueberry <- function(
     mae = mae,
     x_var = "treatment_any",
     y_var = outcome,
-    path_templates = list(route = path_template),
+    route = path_template,
     covariates = outcome_covars,
     sis_n = 100,
     cor_method = "spearman",
     min_abs_cor = 0.2,
     cor_q_threshold = 0.25,
     y_family = "gaussian",
-    fusion_mode = fusion_mode,
+    fusion = fa$fusion,
+    integrated_learner_fusion = fa$integrated_learner_fusion,
     lambda_choice = "lambda.min",
     glmnet_alpha = 0.5,
-    b_inference = "debiased_lasso"
+    b_inference = "debiased"
   )
 }
 
@@ -168,16 +185,18 @@ seq_outcomes <- c(
 )
 
 seq_fits <- list()
+# Sequential fits: supplementary early fusion and the default multiview model.
+seq_fusion_labels <- c("early", "multiview")
 
 for (route_name in names(seq_routes)) {
   seq_fits[[route_name]] <- list()
-  for (fusion in fusion_modes) {
+  for (fusion in seq_fusion_labels) {
     seq_fits[[route_name]][[fusion]] <- lapply(seq_outcomes, function(outcome) {
       run_sequential_blueberry(
         mae = mae_all,
         outcome = outcome,
         path_template = seq_routes[[route_name]],
-        fusion_mode = fusion
+        fusion_label = fusion
       )
     })
     names(seq_fits[[route_name]][[fusion]]) <- seq_outcomes
@@ -185,17 +204,17 @@ for (route_name in names(seq_routes)) {
 }
 
 # Example:
-# summarize_sequential_zentangler(seq_fits[["species_dna_pathways"]][["early"]][["cGMP_change"]])
-# zentangler_sequential_paths(seq_fits[["species_rna_ecs"]][["late"]][["Trigl_change"]])
-# zentangler_sequential_edges(seq_fits[["species_dna_ecs"]][["intermediate"]][["IL6_pg_ml20_change"]])
+# summary(seq_fits[["species_dna_pathways"]][["early"]][["cGMP_change"]])
+# zentangler_paths(seq_fits[["species_rna_ecs"]][["multiview"]][["Trigl_change"]])
+# seq_fits[["species_dna_ecs"]][["multiview"]][["IL6_pg_ml20_change"]]$edges
 
 # -----------------------------
 # Optional: quick extractor
 # -----------------------------
 get_parallel_active <- function(fit) {
-  fit[["mediators_active"]]
+  zentangler_mediators(fit, q_threshold = 0.25)
 }
 
 get_sequential_paths <- function(fit) {
-  zentangler_sequential_paths(fit)
+  zentangler_paths(fit)
 }

@@ -252,10 +252,16 @@ mae_t1_abc
 
 # Run Zentangler
 
-Zentangler fits all selected views in one multiview model. For quick iteration,
-start with the fast lasso preset and a modest SIS screen. Increase `sis_n`, use
-`method_preset = "full_exploratory"`, or add bootstrap repeats for a larger
-analysis.
+Zentangler fits all selected views in one multiview model through the main
+entry point `zentangler()` (default `model = "parallel"`). Its default outcome
+model is multiview cooperative learning (`fusion = "multiview"`), whose
+agreement parameter `rho` runs from 0 (early fusion) to 1 (late fusion) and is
+chosen by cross-validation; the supplementary IntegratedLearner-style late
+fusion used below (`fusion = "integrated_learner"`,
+`integrated_learner_fusion = "late"`) fits each view first and then combines
+the view-level predictions. For quick iteration, start with a modest SIS screen. Increase
+`sis_n`, turn screening off with `screen_method = "none"`, or add bootstrap
+repeats for a larger analysis.
 
 The ASD example is a time-point contrast, so the call below uses
 `study_design = "time"` instead of passing `x_var = "X"` directly. Zentangler
@@ -264,7 +270,7 @@ explicit `X` column is still kept in the MAE because the HIMA2 comparator helper
 below uses it directly.
 
 ```{r}
-zt_fit <- fit_multiview_parallel_zentangler(
+zt_fit <- zentangler(
   mae_t1_abc,
   y_var = "Y",
   study_design = "time",
@@ -276,7 +282,8 @@ zt_fit <- fit_multiview_parallel_zentangler(
   sis_n = 50,
   sis_rank = "abs_a",
   screen_method = "sis",
-  fusion_mode = "late",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "late",
   y_family = "gaussian",
   fdr_method = "BH",
   fdr_scope = "global",
@@ -284,10 +291,12 @@ zt_fit <- fit_multiview_parallel_zentangler(
   seed = 1
 )
 
-zentangler_model_summary(zt_fit)
-zentangler_view_summary(zt_fit, q_threshold = 0.25)
-zentangler_top_mediators(zt_fit, n = 20)
-zentangler_active_mediators(zt_fit, q_threshold = 0.25)
+zt_summary <- summary(zt_fit, q_threshold = 0.25)
+zt_summary$model
+zt_summary$views
+zentangler_mediators(zt_fit, top = 20)
+zentangler_mediators(zt_fit, q_threshold = 0.25)
+zentangler_effects(zt_fit)
 ```
 
 Save the main outputs:
@@ -296,14 +305,14 @@ Save the main outputs:
 out_dir <- file.path("tutorial_results", "zentangler_t1_abc")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-write.csv(zentangler_all_mediators(zt_fit),
-          file.path(out_dir, "zentangler_all_mediators.csv"),
+write.csv(zentangler_mediators(zt_fit),
+          file.path(out_dir, "zentangler_mediators.csv"),
           row.names = FALSE)
-write.csv(zentangler_active_mediators(zt_fit, q_threshold = 0.25),
-          file.path(out_dir, "zentangler_active_mediators_q0p25.csv"),
+write.csv(zentangler_mediators(zt_fit, q_threshold = 0.25),
+          file.path(out_dir, "zentangler_active_q0p25.csv"),
           row.names = FALSE)
-write.csv(zentangler_view_summary(zt_fit, q_threshold = 0.25),
-          file.path(out_dir, "zentangler_view_summary_q0p25.csv"),
+write.csv(summary(zt_fit, q_threshold = 0.25)$views,
+          file.path(out_dir, "zentangler_views_q0p25.csv"),
           row.names = FALSE)
 saveRDS(zt_fit, file.path(out_dir, "zentangler_fit.rds"))
 ```
@@ -511,7 +520,8 @@ for (contrast in contrasts) {
         sis_n = 50,
         sis_rank = "abs_a",
         screen_method = "sis",
-        fusion_mode = "late",
+        fusion = "integrated_learner",
+        integrated_learner_fusion = "late",
         y_family = "gaussian",
         fdr_method = "BH",
         fdr_scope = "global",
@@ -527,7 +537,7 @@ for (contrast in contrasts) {
     )
 
     if (!is.null(zt)) {
-      zt_tab <- zentangler_all_mediators(zt)
+      zt_tab <- zentangler_mediators(zt)
       zt_tab$contrast <- contrast
       zt_tab$symptom <- symptom
       all_zentangler[[key]] <- zt_tab
@@ -548,46 +558,131 @@ hima2_all <- if (length(all_hima2)) do.call(rbind, all_hima2) else data.frame()
 all_errors
 ```
 
-# Zentangler Simulations
+# Simulation Check
 
-Zentangler also includes SIMMBA/InterSIM-style simulation helpers. This is useful
-for checking that a method recovers known mediators before running the real ASD
-analysis.
+Before running the real ASD analysis, it is useful to check that a method
+recovers known mediators. The small simulator below is written inline (it only
+needs base R, `MultiAssayExperiment` and `SummarizedExperiment`). It draws a
+binary exposure `X`, an `age` covariate, three views with 120, 80 and 50
+features, and five true mediators with an A-path (`X -> M`) and a B-path
+(`M -> Y`). It stores a continuous outcome `Y`, a binary outcome `Y_binary`,
+and a survival outcome (`time`, 0/1 `status`). The true mediators are returned
+as `"view::feature"` ids.
+
+Larger benchmarks (more replicates and simulation designs) are not part of the
+package; the benchmarking scripts are maintained separately.
+
+```{r}
+simulate_mediation_mae <- function(n = 200,
+                                   p = c(view1 = 120, view2 = 80, view3 = 50),
+                                   n_true = c(view1 = 2, view2 = 2, view3 = 1),
+                                   a_effect = 0.6,
+                                   b_effect = 0.5,
+                                   direct_effect = 0.4,
+                                   seed = 1) {
+  set.seed(seed)
+  sample_ids <- sprintf("sample_%03d", seq_len(n))
+  X <- rbinom(n, 1, 0.5)
+  age <- rnorm(n, mean = 50, sd = 10)
+  age_c <- (age - 50) / 10
+
+  lin <- direct_effect * X + 0.2 * age_c
+  truth <- character(0)
+  experiments <- list()
+  for (v in names(p)) {
+    M <- matrix(rnorm(n * p[[v]]), nrow = n)
+    colnames(M) <- sprintf("%s_f%03d", v, seq_len(p[[v]]))
+    k <- seq_len(n_true[[v]])
+    M[, k] <- M[, k] + a_effect * X + 0.2 * age_c       # A-path
+    lin <- lin + b_effect * rowSums(M[, k, drop = FALSE]) # B-path
+    truth <- c(truth, paste(v, colnames(M)[k], sep = "::"))
+    rownames(M) <- sample_ids
+    experiments[[v]] <- SummarizedExperiment(assays = list(abundance = t(M)))
+  }
+
+  event_time <- rexp(n, rate = 0.1 * exp(0.5 * (lin - mean(lin))))
+  censor_time <- rexp(n, rate = 0.05)
+  pheno <- DataFrame(
+    X = X,
+    age = age,
+    Y = lin + rnorm(n),
+    Y_binary = rbinom(n, 1, plogis(lin - mean(lin))),
+    time = pmin(event_time, censor_time),
+    status = as.integer(event_time <= censor_time),
+    row.names = sample_ids
+  )
+
+  list(
+    mae = MultiAssayExperiment(experiments = ExperimentList(experiments), colData = pheno),
+    truth = truth
+  )
+}
+
+# True/false positives among the active mediators, plus top-N precision.
+# `found` are the active "view::feature" ids, `ranked` all ids in rank order.
+recovery_metrics <- function(found, ranked, truth, rep = NA_integer_, top_n = 50) {
+  top <- utils::head(ranked, top_n)
+  data.frame(
+    rep = rep,
+    n_active = length(found),
+    true_active = sum(found %in% truth),
+    false_active = sum(!(found %in% truth)),
+    precision = if (length(found) > 0) mean(found %in% truth) else NA_real_,
+    recall = mean(truth %in% found),
+    fdr = if (length(found) > 0) mean(!(found %in% truth)) else 0,
+    top50_true = sum(top %in% truth),
+    top50_precision = sum(top %in% truth) / top_n
+  )
+}
+
+zentangler_recovery_metrics <- function(fit, truth, rep = NA_integer_, q = 0.25) {
+  active <- zentangler_mediators(fit, q_threshold = q)
+  ranked <- zentangler_mediators(fit)
+  recovery_metrics(
+    found = paste(active$omics, active$mediator, sep = "::"),
+    ranked = paste(ranked$omics, ranked$mediator, sep = "::"),
+    truth = truth,
+    rep = rep
+  )
+}
+
+hima2_recovery_metrics <- function(tab, truth, rep = NA_integer_, q = 0.25) {
+  if (nrow(tab) == 0) return(data.frame())
+  ids <- paste(tab$omics, tab$mediator, sep = "::")
+  q_val <- as.numeric(tab$q_primary)
+  recovery_metrics(
+    found = ids[is.finite(q_val) & q_val <= q],
+    ranked = ids[order(tab$abs_score, decreasing = TRUE)],
+    truth = truth,
+    rep = rep
+  )
+}
+```
 
 ```{r, fig.width=8, fig.align='center', fig.height=6}
-set.seed(1)
-
-sim <- gen_simmba(
-  nsample = 500,
-  nrep =5,
-  snr = 1,
-  n.pathways = 30,
-  TIE = rep(1, 3),
-  outcome.type = "continuous",
-  ygen.mode = "LM",
-  seed = 1
-)
+n_sim_rep <- 5
 
 zentangler_sim_recovery <- list()
 hima2_sim_recovery <- list()
 zentangler_sim_summaries <- list()
 hima2_sim_results <- list()
 
-for (rep_i in seq_along(sim$trainMae)) {
-  sim_mae <- sim$trainMae[[rep_i]]
-  truth <- sim$truthDat[[rep_i]]
-  truth_key <- zentangler_truth_key(truth)
+for (rep_i in seq_len(n_sim_rep)) {
+  sim <- simulate_mediation_mae(seed = rep_i)
+  sim_mae <- sim$mae
+  truth <- sim$truth
 
   sim_fit <- fit_multiview_parallel_zentangler(
     sim_mae,
-    x_var = "A",
+    x_var = "X",
     y_var = "Y",
     covariates = NULL,
     glmnet_alpha = 0.5,
     sis_n = 50,
     sis_rank = "abs_a",
     screen_method = "sis",
-    fusion_mode = "late",
+    fusion = "integrated_learner",
+    integrated_learner_fusion = "late",
     y_family = "gaussian",
     fdr_method = "BH",
     fdr_scope = "global",
@@ -597,39 +692,20 @@ for (rep_i in seq_along(sim$trainMae)) {
     seed = rep_i
   )
 
-  zentangler_tab <- zentangler_all_mediators(sim_fit)
-  zentangler_sim_summaries[[rep_i]] <- summarize_zentangler(
+  zentangler_sim_summaries[[rep_i]] <- summary(
     sim_fit,
     q_threshold = seq(0.05, 0.25, by = 0.05)
   )
-  zentangler_sim_recovery[[rep_i]] <- zentangler_score_truth_recovery(
-    zentangler_tab,
-    truth_key = truth_key,
-    rep = rep_i,
-    fusion_mode = "late",
-    q_threshold = 0.25,
-    q_col = "q_primary",
-    fdr_scope = "global",
-    top_n = 50
-  )
+  zentangler_sim_recovery[[rep_i]] <- zentangler_recovery_metrics(sim_fit, truth, rep = rep_i)
 
   hima2_tab <- run_hima2_mae(
     sim_mae,
-    x_var = "A",
+    x_var = "X",
     y_var = "Y",
     rep = rep_i
   )
   hima2_sim_results[[rep_i]] <- hima2_tab
-  hima2_sim_recovery[[rep_i]] <- zentangler_score_truth_recovery(
-    hima2_tab,
-    truth_key = truth_key,
-    rep = rep_i,
-    fusion_mode = "singleview_hima2",
-    q_threshold = 0.25,
-    q_col = "q_primary",
-    fdr_scope = "global",
-    top_n = 50
-  )
+  hima2_sim_recovery[[rep_i]] <- hima2_recovery_metrics(hima2_tab, truth, rep = rep_i)
 }
 
 zentangler_recovery <- do.call(rbind, zentangler_sim_recovery)
@@ -694,35 +770,23 @@ legend(
 
 ## Binary Simulation Check
 
-For binary outcomes, SIMMBA stores the generated outcome in `Y`. Zentangler uses
-`y_family = "binomial"`, and HIMA2 is run with `outcome_family = "binomial"`
-when the installed HIMA API exposes that argument.
+For binary outcomes, the simulator stores the generated outcome in `Y_binary`.
+Zentangler uses `y_family = "binomial"`, and HIMA2 is run with
+`outcome_family = "binomial"` when the installed HIMA API exposes that argument.
 
 ```{r}
-set.seed(1)
-
-sim_binary <- gen_simmba(
-  nsample = 100,
-  nrep = 1,
-  snr = 1,
-  n.pathways = 10,
-  TIE = rep(1, 3),
-  outcome.type = "binary",
-  ygen.mode = "LM",
-  seed = 1
-)
-
-binary_mae <- sim_binary$trainMae[[1]]
-binary_truth <- sim_binary$truthDat[[1]]
-binary_truth_key <- zentangler_truth_key(binary_truth)
+sim_binary <- simulate_mediation_mae(seed = 1)
+binary_mae <- sim_binary$mae
+binary_truth <- sim_binary$truth
 
 binary_fit <- fit_multiview_parallel_zentangler(
   binary_mae,
-  x_var = "A",
-  y_var = "Y",
+  x_var = "X",
+  y_var = "Y_binary",
   y_family = "binomial",
-  fusion_mode = "early",
-  b_inference = "debiased_logistic_lasso",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
+  b_inference = "debiased",
   sis_n = 50,
   screen_method = "sis",
   fdr_method = "BH",
@@ -731,43 +795,20 @@ binary_fit <- fit_multiview_parallel_zentangler(
   seed = 1
 )
 
-binary_zentangler_tab <- zentangler_all_mediators(binary_fit)
-binary_zentangler_recovery <- zentangler_score_truth_recovery(
-  binary_zentangler_tab,
-  truth_key = binary_truth_key,
-  rep = 1,
-  fusion_mode = "early_binary",
-  q_threshold = 0.25,
-  q_col = "q_primary",
-  fdr_scope = "global",
-  top_n = 50
-)
+binary_zentangler_recovery <- zentangler_recovery_metrics(binary_fit, binary_truth, rep = 1)
 
 binary_hima2_tab <- tryCatch(
   run_hima2_mae(
     binary_mae,
-    x_var = "A",
-    y_var = "Y",
+    x_var = "X",
+    y_var = "Y_binary",
     rep = 1,
     outcome_family = "binomial"
   ),
   error = function(e) data.frame()
 )
 
-binary_hima2_recovery <- if (nrow(binary_hima2_tab) > 0) {
-  zentangler_score_truth_recovery(
-    binary_hima2_tab,
-    truth_key = binary_truth_key,
-    rep = 1,
-    fusion_mode = "singleview_hima2_binary",
-    q_threshold = 0.25,
-    q_col = "q_primary",
-    fdr_scope = "global",
-    top_n = 50
-  )
-} else {
-  data.frame()
-}
+binary_hima2_recovery <- hima2_recovery_metrics(binary_hima2_tab, binary_truth, rep = 1)
 
 binary_zentangler_recovery
 binary_hima2_recovery
@@ -775,36 +816,26 @@ binary_hima2_recovery
 
 ## Survival Simulation Check
 
-For survival outcomes, SIMMBA stores the outcome as `time` and `status`.
-Zentangler supports Cox survival Y-stage models. This quick check avoids
-bootstrap and compares the two non-bootstrap survival B-stage options.
+For survival outcomes, the simulator stores the outcome as `time` and `status`.
+Zentangler supports Cox survival Y-stage models. This quick check compares the
+two survival B-stage options: the de-biased (de-sparsified Cox lasso) B-stage
+and a small full-pipeline bootstrap.
 
 ```{r}
-set.seed(1)
+sim_surv <- simulate_mediation_mae(seed = 1)
+surv_mae <- sim_surv$mae
+surv_truth <- sim_surv$truth
 
-sim_surv <- gen_simmba(
-  nsample = 100,
-  nrep = 1,
-  snr = 1,
-  n.pathways = 10,
-  TIE = rep(1, 3),
-  outcome.type = "survival",
-  ygen.mode = "LM",
-  seed = 1
-)
-
-surv_mae <- sim_surv$trainMae[[1]]
-surv_truth <- sim_surv$truthDat[[1]]
-surv_truth_key <- zentangler_truth_key(surv_truth)
-
-surv_fit_refit <- fit_multiview_parallel_zentangler(
+surv_fit_boot <- fit_multiview_parallel_zentangler(
   surv_mae,
-  x_var = "A",
+  x_var = "X",
   y_family = "survival",
   survival_time_var = "time",
   survival_event_var = "status",
-  fusion_mode = "early",
-  b_inference = "refit",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
+  b_inference = "bootstrap",
+  bootstrap_repeats = 20,
   sis_n = 10,
   screen_method = "sis",
   fdr_method = "BH",
@@ -815,12 +846,13 @@ surv_fit_refit <- fit_multiview_parallel_zentangler(
 
 surv_fit_cox <- fit_multiview_parallel_zentangler(
   surv_mae,
-  x_var = "A",
+  x_var = "X",
   y_family = "survival",
   survival_time_var = "time",
   survival_event_var = "status",
-  fusion_mode = "early",
-  b_inference = "debiased_cox_lasso",
+  fusion = "integrated_learner",
+  integrated_learner_fusion = "early",
+  b_inference = "debiased",
   sis_n = 10,
   screen_method = "sis",
   fdr_method = "BH",
@@ -829,28 +861,9 @@ surv_fit_cox <- fit_multiview_parallel_zentangler(
   seed = 1
 )
 
-surv_refit_recovery <- zentangler_score_truth_recovery(
-  zentangler_all_mediators(surv_fit_refit),
-  truth_key = surv_truth_key,
-  rep = 1,
-  fusion_mode = "early_survival_refit",
-  q_threshold = 0.25,
-  q_col = "q_primary",
-  fdr_scope = "global",
-  top_n = 50
-)
-
-surv_cox_recovery <- zentangler_score_truth_recovery(
-  zentangler_all_mediators(surv_fit_cox),
-  truth_key = surv_truth_key,
-  rep = 1,
-  fusion_mode = "early_survival_debiased_cox_lasso",
-  q_threshold = 0.25,
-  q_col = "q_primary",
-  fdr_scope = "global",
-  top_n = 50
-)
+surv_boot_recovery <- zentangler_recovery_metrics(surv_fit_boot, surv_truth, rep = 1)
+surv_cox_recovery <- zentangler_recovery_metrics(surv_fit_cox, surv_truth, rep = 1)
 
 surv_cox_recovery
-surv_refit_recovery
+surv_boot_recovery
 ```

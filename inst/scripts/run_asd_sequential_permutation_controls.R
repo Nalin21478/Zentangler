@@ -270,7 +270,7 @@ run_one <- function(mae_obs, route_views, meta, args) {
     mae_run,
     x_var = args$x_var,
     y_var = args$y_var,
-    path_templates = stats::setNames(list(route_views), meta$route_name),
+    route = route_views,
     sis_n = meta$sis_n,
     cor_method = args$cor_method,
     min_abs_cor = meta$min_abs_cor,
@@ -281,9 +281,9 @@ run_one <- function(mae_obs, route_views, meta, args) {
     seed = meta$seed
   )
 
-  paths <- zentangler_sequential_paths(fit)
-  terminals <- zentangler_sequential_terminals(fit)
-  model_summary <- summarize_sequential_zentangler(fit)$model_summary
+  paths <- zentangler_paths(fit)
+  terminals <- fit$terminals
+  model_summary <- summary(fit)$model
   path_summary <- summarize_paths(paths, q_threshold = args$q_threshold)
 
   if (nrow(paths) > 0L) paths <- cbind(meta[rep(1L, nrow(paths)), , drop = FALSE], paths)

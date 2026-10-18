@@ -30,6 +30,48 @@ mae_rows_mean_by_id <- function(df_like) {
   as.data.frame(out, check.names = FALSE, stringsAsFactors = FALSE)
 }
 
+zentangler_transform_block <- function(block, method = c("none", "log", "clr"), pseudocount = NULL, view = "view") {
+  # Per-view feature transformation applied to the samples x features block.
+  #   "log": log(x + pseudocount)
+  #   "clr": centered log-ratio, log(x + pseudocount) minus the per-sample mean
+  #          of log(x + pseudocount) over the view's features
+  # The pseudocount defaults to half the smallest positive value in the view.
+  # Both require non-negative data (counts or relative abundances).
+  method <- match.arg(method)
+  if (identical(method, "none")) return(block)
+  M <- as.matrix(block)
+  vals <- M[is.finite(M)]
+  if (any(vals < 0)) {
+    stop("transform = '", method, "' for view '", view, "' needs non-negative values; the view has negative entries.", call. = FALSE)
+  }
+  if (is.null(pseudocount)) {
+    pos <- vals[vals > 0]
+    if (length(pos) == 0L) stop("View '", view, "' has no positive values to transform.", call. = FALSE)
+    pseudocount <- min(pos) / 2
+  }
+  if (!is.finite(pseudocount) || pseudocount < 0) stop("pseudocount must be a non-negative number.", call. = FALSE)
+  L <- log(M + pseudocount)
+  if (identical(method, "clr")) L <- L - rowMeans(L, na.rm = TRUE)
+  out <- as.data.frame(L, check.names = FALSE, stringsAsFactors = FALSE)
+  rownames(out) <- rownames(block)
+  attr(out, "zentangler_transform") <- list(method = method, pseudocount = pseudocount)
+  out
+}
+
+zentangler_per_view <- function(x, views, default, label) {
+  # Expand a single value or a (partially) named vector to one value per view.
+  if (is.null(x)) return(setNames(rep(list(default), length(views)), views))
+  if (is.null(names(x))) {
+    if (length(x) != 1L) stop(label, " must be a single value or a vector named by view.", call. = FALSE)
+    return(setNames(rep(list(x[[1L]]), length(views)), views))
+  }
+  unknown <- setdiff(names(x), views)
+  if (length(unknown) > 0L) stop(label, " names views that are not analysed: ", paste(unknown, collapse = ", "), call. = FALSE)
+  out <- setNames(rep(list(default), length(views)), views)
+  for (v in names(x)) out[[v]] <- x[[v]]
+  out
+}
+
 zentangler_mae_coldata <- function(mae) {
   zentangler_require_mae()
   cd <- as.data.frame(SummarizedExperiment::colData(mae), stringsAsFactors = FALSE)
@@ -148,7 +190,9 @@ zentangler_mae_to_blocks <- function(
   view_names = NULL,
   assay_names = NULL,
   duplicate_primary = c("mean", "first"),
-  fill_nonfinite_zero = FALSE
+  fill_nonfinite_zero = FALSE,
+  transform = "none",
+  pseudocount = NULL
 ) {
   duplicate_primary <- match.arg(duplicate_primary)
   zentangler_require_mae()
@@ -183,15 +227,37 @@ zentangler_mae_to_blocks <- function(
     stringsAsFactors = FALSE
   )
 
+  # transform / pseudocount may be given once or per view (by experiment name
+  # or sanitized view name).
+  name_map <- setNames(view_names, view_names)
+  name_map[safe_names] <- view_names
+  rename <- function(x) {
+    if (is.null(x) || is.null(names(x))) return(x)
+    nm <- names(x)
+    hit <- nm %in% names(name_map)
+    nm[hit] <- name_map[nm[hit]]
+    names(x) <- nm
+    x
+  }
+  transform_by_view <- zentangler_per_view(rename(transform), view_names, "none", "transform")
+  pseudo_by_view <- zentangler_per_view(rename(pseudocount), view_names, NULL, "pseudocount")
+  view_map$transform <- vapply(view_names, function(v) as.character(transform_by_view[[v]]), character(1))
+
   for (i in seq_along(view_names)) {
     an <- assay_names[[view_names[i]]]
     if (is.na(an) || !nzchar(an)) an <- NULL
-    blocks[[safe_names[i]]] <- zentangler_mae_extract_block(
+    block <- zentangler_mae_extract_block(
       mae = mae,
       experiment_name = view_names[i],
       assay_name = an,
       duplicate_primary = duplicate_primary,
       fill_nonfinite_zero = fill_nonfinite_zero
+    )
+    blocks[[safe_names[i]]] <- zentangler_transform_block(
+      block,
+      method = transform_by_view[[view_names[i]]],
+      pseudocount = pseudo_by_view[[view_names[i]]],
+      view = view_names[i]
     )
   }
 

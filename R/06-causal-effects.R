@@ -90,92 +90,98 @@ estimate_reduced_x_summary <- function(Y, X, C = NULL, y_family = c("gaussian", 
   )
 }
 
-estimate_reduced_x_effect <- function(Y, X, C = NULL, y_family = c("gaussian", "binomial", "survival"), x0 = NULL, x1 = NULL) {
-  estimate_reduced_x_summary(
-    Y = Y,
-    X = X,
-    C = C,
-    y_family = y_family,
-    x0 = x0,
-    x1 = x1
-  )$reduced_total_effect[[1L]]
-}
+# -----------------------------------------------------------------------------
+# Post-selection causal effect stage (parallel)
+#
+# Effects are estimated for a fixed effect set of mediators (by default the
+# mediators with q_primary <= effect_q_threshold). For that set the stage fits
+#   mediator models   M_j ~ X + C                (linear, one per mediator)
+#   outcome model     Y ~ X + C + M_set          (lm / logistic glm / Cox)
+# without penalization, and computes
+#   NDE = E[Y(x1, M(x0))] - E[Y(x0, M(x0))]
+#   NIE = E[Y(x1, M(x1))] - E[Y(x1, M(x0))]
+#   TE  = NDE + NIE
+# by parametric g-computation. The outcome scale is the mean difference
+# (gaussian), the risk difference (binomial) or the conditional log hazard
+# ratio (survival, computed on the Cox linear predictor). Per-mediator indirect
+# effects shift one mediator at a time and are on the same scale as NIE. The
+# model assumes no exposure-mediator interaction.
+# -----------------------------------------------------------------------------
 
-make_active_mediator_matrix <- function(combined_mediators, blocks) {
-  if (is.null(combined_mediators) || nrow(combined_mediators) == 0) {
-    return(list(M = matrix(nrow = nrow(blocks[[1]]), ncol = 0), map = data.frame()))
+zentangler_effect_set <- function(combined_mediators, q_threshold = 0.25, q_col = "q_primary") {
+  if (is.null(combined_mediators) || nrow(combined_mediators) == 0L) {
+    return(data.frame(omics = character(0), mediator = character(0), stringsAsFactors = FALSE))
   }
-  active <- is.finite(combined_mediators$a) &
-    is.finite(combined_mediators$b) &
-    combined_mediators$b != 0
-  active_tab <- combined_mediators[active, , drop = FALSE]
-  if (nrow(active_tab) == 0) {
-    return(list(M = matrix(nrow = nrow(blocks[[1]]), ncol = 0), map = data.frame()))
-  }
-
-  mats <- list()
-  map <- data.frame(
-    omics = character(),
-    mediator = character(),
-    design_name = character(),
-    a = numeric(),
-    b_original = numeric(),
+  q <- combined_mediators[[q_col]]
+  keep <- is.finite(q) & q <= q_threshold & is.finite(combined_mediators$b) & combined_mediators$b != 0
+  data.frame(
+    omics = as.character(combined_mediators$omics[keep]),
+    mediator = as.character(combined_mediators$mediator[keep]),
     stringsAsFactors = FALSE
   )
-  for (ii in seq_len(nrow(active_tab))) {
-    view <- as.character(active_tab$omics[ii])
-    med <- as.character(active_tab$mediator[ii])
+}
+
+make_effect_mediator_matrix <- function(effect_set, blocks, n) {
+  if (is.null(effect_set) || nrow(effect_set) == 0L) {
+    return(list(M = matrix(nrow = n, ncol = 0), map = data.frame(omics = character(0), mediator = character(0), design_name = character(0), stringsAsFactors = FALSE)))
+  }
+  mats <- list()
+  keep <- logical(nrow(effect_set))
+  for (ii in seq_len(nrow(effect_set))) {
+    view <- effect_set$omics[ii]
+    med <- effect_set$mediator[ii]
     if (!(view %in% names(blocks)) || !(med %in% colnames(blocks[[view]]))) next
-    design_name <- paste0(view, "::", med)
-    vals <- as.matrix(blocks[[view]][, med, drop = FALSE])
-    colnames(vals) <- design_name
-    mats[[length(mats) + 1L]] <- vals
-    map <- rbind(
-      map,
-      data.frame(
-        omics = view,
-        mediator = med,
-        design_name = design_name,
-        a = as.numeric(active_tab$a[ii]),
-        b_original = as.numeric(active_tab$b[ii]),
-        stringsAsFactors = FALSE
-      )
-    )
+    keep[ii] <- TRUE
+    mats[[length(mats) + 1L]] <- as.numeric(blocks[[view]][, med])
   }
-  if (length(mats) == 0) {
-    return(list(M = matrix(nrow = nrow(blocks[[1]]), ncol = 0), map = data.frame()))
-  }
-  list(M = do.call(cbind, mats), map = map)
+  map <- effect_set[keep, c("omics", "mediator"), drop = FALSE]
+  map$design_name <- if (nrow(map) > 0L) make.names(paste0("M_", map$omics, "__", map$mediator), unique = TRUE) else character(0)
+  if (length(mats) == 0L) return(list(M = matrix(nrow = n, ncol = 0), map = map))
+  M <- do.call(cbind, mats)
+  colnames(M) <- map$design_name
+  rownames(map) <- NULL
+  list(M = M, map = map)
 }
 
 fit_active_outcome_effect_model <- function(Y, X, M_active, C = NULL, y_family = c("gaussian", "binomial", "survival")) {
+  # Unpenalized outcome model used by the causal effect stage. Returns
+  # coefficients for the design matrix (including a zero intercept for Cox,
+  # whose linear predictor has no intercept), or NULL coefficients with a
+  # warning when the fit fails.
   y_family <- match.arg(y_family)
   Z <- cbind(`(Intercept)` = 1, X = as.numeric(X))
-  if (!is.null(C) && ncol(C) > 0) {
-    C2 <- as.matrix(C)
-    colnames(C2) <- paste0("C::", colnames(C2))
-    Z <- cbind(Z, C2)
-  }
+  if (!is.null(C) && ncol(C) > 0) Z <- cbind(Z, as.matrix(C))
   if (!is.null(M_active) && ncol(M_active) > 0) Z <- cbind(Z, as.matrix(M_active))
   Z <- as.matrix(Z)
 
+  if (ncol(Z) >= nrow(Z) - 2L) {
+    warning("Effect model has as many parameters as samples; causal effects are NA. Use a stricter effect_q_threshold.", call. = FALSE)
+    return(list(coefficients = NULL, design = Z))
+  }
   fit <- try(
     if (identical(y_family, "survival")) {
-      dat <- as.data.frame(Z[, -1, drop = FALSE], check.names = TRUE)
-      survival::coxph(Y ~ ., data = dat)
+      survival::coxph(Y ~ Z[, -1, drop = FALSE])
     } else if (identical(y_family, "gaussian")) {
       stats::lm.fit(x = Z, y = as.numeric(Y))
     } else {
-      suppressWarnings(stats::glm.fit(x = Z, y = as.numeric(Y), family = stats::binomial(), intercept = FALSE))
+      suppressWarnings(stats::glm.fit(x = Z, y = as.numeric(Y), family = stats::binomial(), intercept = TRUE))
     },
     silent = TRUE
   )
   if (inherits(fit, "try-error") || is.null(fit$coefficients)) {
-    co <- setNames(rep(0, ncol(Z)), colnames(Z))
-  } else {
-    co <- fit$coefficients
-    names(co) <- colnames(Z)
-    co[!is.finite(co)] <- 0
+    warning("Causal effect outcome model failed; causal effects are NA.", call. = FALSE)
+    return(list(coefficients = NULL, design = Z))
+  }
+  co <- as.numeric(fit$coefficients)
+  if (identical(y_family, "survival")) co <- c(0, co)
+  names(co) <- colnames(Z)
+  if (any(!is.finite(co))) {
+    warning("Causal effect outcome model is rank deficient or separated; causal effects are NA.", call. = FALSE)
+    return(list(coefficients = NULL, design = Z))
+  }
+  if (identical(y_family, "binomial") && isFALSE(fit$converged)) {
+    warning("Causal effect logistic model did not converge (possible separation); causal effects are NA.", call. = FALSE)
+    return(list(coefficients = NULL, design = Z))
   }
   list(coefficients = co, design = Z)
 }
@@ -192,265 +198,215 @@ predict_effect_mean <- function(co, Z_template, X_value, M_value = NULL, y_famil
   if (identical(y_family, "binomial")) stats::plogis(eta) else eta
 }
 
+zentangler_effect_labels <- function(y_family, sequential = FALSE) {
+  suffix <- if (sequential) "_sequential" else ""
+  list(
+    method = paste0(switch(y_family,
+      gaussian = "parametric_g_computation_linear",
+      binomial = "parametric_g_computation_logistic",
+      survival = "parametric_g_computation_cox_linear_predictor"
+    ), suffix),
+    scale = switch(y_family,
+      gaussian = "mean_difference",
+      binomial = "risk_difference",
+      survival = "log_hazard_ratio"
+    )
+  )
+}
+
+zentangler_na_effect_row <- function(y_family, contrast, reduced_summary, n_active, view_names = character(0), sequential = FALSE) {
+  lab <- zentangler_effect_labels(y_family, sequential)
+  out <- data.frame(
+    effect_method = lab$method,
+    effect_scale = lab$scale,
+    x0 = contrast[["x0"]], x1 = contrast[["x1"]], delta_x = contrast[["delta"]],
+    nde = NA_real_, nie_total = NA_real_, te = NA_real_, prop_mediated = NA_real_,
+    reduced_total_effect = reduced_summary$reduced_total_effect[[1L]],
+    reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
+    p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
+    direct_coefficient_active_model = NA_real_,
+    n_active_total = as.integer(n_active),
+    stringsAsFactors = FALSE
+  )
+  for (view in view_names) {
+    safe <- make.names(view)
+    out[[paste0("nie_", safe)]] <- NA_real_
+    out[[paste0("n_active_", safe)]] <- 0L
+  }
+  out
+}
+
 compute_effect_decomposition_multiview <- function(
-  combined_mediators,
-  direct_effect,
+  effect_set,
   Y,
   X,
   blocks,
   C = NULL,
   y_family = c("gaussian", "binomial", "survival"),
-  x0 = NULL,
-  x1 = NULL
+  x0,
+  x1
 ) {
   y_family <- match.arg(y_family)
-  contrast <- infer_effect_contrast(X, x0 = x0, x1 = x1)
-  x0 <- contrast[["x0"]]
-  x1 <- contrast[["x1"]]
-  delta_x <- contrast[["delta"]]
+  contrast <- c(x0 = as.numeric(x0), x1 = as.numeric(x1), delta = as.numeric(x1) - as.numeric(x0))
+  n <- length(as.numeric(X))
+  reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+  info <- make_effect_mediator_matrix(effect_set, blocks, n)
+  M_obs <- info$M
+  map <- info$map
+  view_names <- names(blocks)
+  lab <- zentangler_effect_labels(y_family)
 
-  active_info <- make_active_mediator_matrix(combined_mediators, blocks)
-  M_obs <- active_info$M
-  active_map <- active_info$map
-
-  if (identical(y_family, "survival")) {
-    direct_linear_product <- as.numeric(direct_effect) * delta_x
-    indirect_linear_product <- if (nrow(active_map) > 0) sum(active_map$a * active_map$b_original * delta_x, na.rm = TRUE) else 0
-    reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
-    reduced_te <- reduced_summary$reduced_total_effect[[1L]]
-    return(data.frame(
-      effect_method = "cox_log_hazard_product_summary",
-      effect_scale = "log_hazard_ratio",
-      x0 = x0,
-      x1 = x1,
-      delta_x = delta_x,
-      nde = direct_linear_product,
-      nie_total = indirect_linear_product,
-      te = direct_linear_product + indirect_linear_product,
-      prop_mediated = if (is.finite(reduced_te) && abs(reduced_te) > 1e-08) indirect_linear_product / reduced_te else NA_real_,
-      reduced_total_effect = reduced_te,
-      reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
-      p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
-      decomposition_gap = NA_real_,
-      direct_effect = direct_linear_product,
-      indirect_total = indirect_linear_product,
-      total_decomp = direct_linear_product + indirect_linear_product,
-      direct_coefficient_active_model = as.numeric(direct_effect),
-      direct_effect_y_model_coefficient = as.numeric(direct_effect),
-      direct_effect_y_model_product = direct_linear_product,
-      indirect_product_sum = indirect_linear_product,
-      n_active_total = nrow(active_map),
-      stringsAsFactors = FALSE
+  effect_fit <- fit_active_outcome_effect_model(Y = Y, X = X, M_active = M_obs, C = C, y_family = y_family)
+  if (is.null(effect_fit$coefficients)) {
+    return(list(
+      effects = zentangler_na_effect_row(y_family, contrast, reduced_summary, nrow(map), view_names),
+      mediator_effects = data.frame(omics = map$omics, mediator = map$mediator, a_effect_model = rep(NA_real_, nrow(map)), b_effect_model = rep(NA_real_, nrow(map)), indirect_effect = rep(NA_real_, nrow(map)), stringsAsFactors = FALSE)
     ))
   }
-
-  effect_fit <- fit_active_outcome_effect_model(
-    Y = Y,
-    X = X,
-    M_active = M_obs,
-    C = C,
-    y_family = y_family
-  )
   co <- effect_fit$coefficients
   Z_template <- effect_fit$design
 
+  # Linear mediator models M_j ~ X + C on the same samples.
+  a_eff <- setNames(rep(NA_real_, nrow(map)), map$design_name)
+  if (ncol(M_obs) > 0L) {
+    a_tab <- zentangler_a_stage_lm(M_obs, X, C)
+    a_eff[] <- a_tab$a_hat
+  }
   M_x0 <- M_obs
   M_x1 <- M_obs
-  if (ncol(M_obs) > 0 && nrow(active_map) > 0) {
-    for (jj in seq_len(nrow(active_map))) {
-      dn <- active_map$design_name[jj]
-      a_j <- active_map$a[jj]
-      if (!is.finite(a_j) || !(dn %in% colnames(M_obs))) next
-      M_x0[, dn] <- M_obs[, dn] + a_j * (x0 - as.numeric(X))
-      M_x1[, dn] <- M_obs[, dn] + a_j * (x1 - as.numeric(X))
-    }
+  for (dn in colnames(M_obs)) {
+    M_x0[, dn] <- M_obs[, dn] + a_eff[[dn]] * (x0 - as.numeric(X))
+    M_x1[, dn] <- M_obs[, dn] + a_eff[[dn]] * (x1 - as.numeric(X))
   }
 
   mu_00 <- predict_effect_mean(co, Z_template, X_value = x0, M_value = M_x0, y_family = y_family)
   mu_10 <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_x0, y_family = y_family)
   mu_11 <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_x1, y_family = y_family)
 
-  nde <- mean(mu_10 - mu_00, na.rm = TRUE)
-  nie <- mean(mu_11 - mu_10, na.rm = TRUE)
-  te <- mean(mu_11 - mu_00, na.rm = TRUE)
-  reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
-  reduced_te <- reduced_summary$reduced_total_effect[[1L]]
-
-  direct_coef <- if ("X" %in% names(co)) as.numeric(co[["X"]]) else NA_real_
-  direct_linear_product <- as.numeric(direct_effect) * delta_x
-  indirect_linear_product <- if (nrow(active_map) > 0) sum(active_map$a * active_map$b_original * delta_x, na.rm = TRUE) else 0
+  nde <- mean(mu_10 - mu_00)
+  nie <- mean(mu_11 - mu_10)
+  te <- nde + nie
 
   out <- data.frame(
-    effect_method = if (identical(y_family, "binomial")) "parametric_g_computation_logistic" else "parametric_g_computation_linear",
-    effect_scale = if (identical(y_family, "binomial")) "risk_difference" else "mean_difference",
+    effect_method = lab$method,
+    effect_scale = lab$scale,
     x0 = x0,
     x1 = x1,
-    delta_x = delta_x,
+    delta_x = contrast[["delta"]],
     nde = nde,
     nie_total = nie,
     te = te,
     prop_mediated = if (is.finite(te) && abs(te) > 1e-08) nie / te else NA_real_,
-    reduced_total_effect = reduced_te,
+    reduced_total_effect = reduced_summary$reduced_total_effect[[1L]],
     reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
     p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
-    decomposition_gap = te - (nde + nie),
-    direct_effect = nde,
-    indirect_total = nie,
-    total_decomp = te,
-    direct_coefficient_active_model = direct_coef,
-    direct_effect_y_model_coefficient = as.numeric(direct_effect),
-    direct_effect_y_model_product = direct_linear_product,
-    indirect_product_sum = indirect_linear_product,
-    n_active_total = nrow(active_map),
+    direct_coefficient_active_model = as.numeric(co[["X"]]),
+    n_active_total = nrow(map),
     stringsAsFactors = FALSE
   )
 
-  views <- if (nrow(active_map) > 0) unique(as.character(active_map$omics)) else character(0)
-  mu_base <- mu_10
-  for (view in views) {
+  # Per-view and per-mediator indirect effects, always reported for every view
+  # so bootstrap replicates have identical columns.
+  for (view in view_names) {
     safe <- make.names(view)
-    M_view <- M_x0
-    idx <- active_map$omics == view
-    view_cols <- active_map$design_name[idx]
-    M_view[, view_cols] <- M_x1[, view_cols, drop = FALSE]
-    mu_view <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_view, y_family = y_family)
-    out[[paste0("nie_", safe)]] <- mean(mu_view - mu_base, na.rm = TRUE)
+    idx <- map$omics == view
+    if (any(idx)) {
+      M_view <- M_x0
+      cols <- map$design_name[idx]
+      M_view[, cols] <- M_x1[, cols, drop = FALSE]
+      mu_view <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_view, y_family = y_family)
+      out[[paste0("nie_", safe)]] <- mean(mu_view - mu_10)
+    } else {
+      out[[paste0("nie_", safe)]] <- 0
+    }
     out[[paste0("n_active_", safe)]] <- sum(idx)
-    out[[paste0("indirect_", safe)]] <- out[[paste0("nie_", safe)]]
   }
 
-  out
-}
-
-build_causal_stage_summary <- function(effect_decomposition, combined_mediators, causal_inference = "none", bootstrap = NULL) {
-  if (is.null(effect_decomposition) || nrow(effect_decomposition) == 0) return(list())
-  active_count <- if (!is.null(combined_mediators) && nrow(combined_mediators) > 0) {
-    sum(is.finite(combined_mediators$b) & combined_mediators$b != 0, na.rm = TRUE)
-  } else {
-    0L
-  }
-  eff <- effect_decomposition[1, , drop = FALSE]
-  list(
-    stage = "post_selection_causal_effects",
-    stage_method = as.character(eff$effect_method[[1]]),
-    effect_scale = as.character(eff$effect_scale[[1]]),
-    causal_inference = as.character(causal_inference)[1],
-    bootstrap_used = isTRUE(identical(causal_inference, "bootstrap")) && !is.null(bootstrap),
-    x0 = as.numeric(eff$x0[[1]]),
-    x1 = as.numeric(eff$x1[[1]]),
-    delta_x = as.numeric(eff$delta_x[[1]]),
-    n_active_mediators = as.integer(active_count),
-    nde = as.numeric(eff$nde[[1]]),
-    nie_total = as.numeric(eff$nie_total[[1]]),
-    te = as.numeric(eff$te[[1]]),
-    prop_mediated = as.numeric(eff$prop_mediated[[1]])
+  med_eff <- data.frame(
+    omics = map$omics,
+    mediator = map$mediator,
+    a_effect_model = as.numeric(a_eff),
+    b_effect_model = as.numeric(co[map$design_name]),
+    indirect_effect = rep(NA_real_, nrow(map)),
+    stringsAsFactors = FALSE
   )
-}
-
-zentangler_sequential_active_keys <- function(paths) {
-  if (is.null(paths) || nrow(paths) == 0L || !("key_path" %in% colnames(paths))) return(character(0))
-  keep <- is.finite(paths$b) & paths$b != 0
-  if (any("q_primary" %in% colnames(paths))) {
-    keep <- keep & is.finite(paths$q_primary)
+  for (ii in seq_len(nrow(map))) {
+    dn <- map$design_name[ii]
+    M_one <- M_x0
+    M_one[, dn] <- M_x1[, dn]
+    mu_one <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_one, y_family = y_family)
+    med_eff$indirect_effect[ii] <- mean(mu_one - mu_10)
   }
-  paths_use <- paths[keep, , drop = FALSE]
-  if (nrow(paths_use) == 0L) return(character(0))
-  unique(unlist(strsplit(as.character(paths_use$key_path), " -> ", fixed = TRUE), use.names = FALSE))
+
+  list(effects = out, mediator_effects = med_eff)
 }
 
-zentangler_sequential_edge_table <- function(paths) {
-  if (is.null(paths) || nrow(paths) == 0L || !("key_path" %in% colnames(paths))) return(data.frame())
-  keep <- is.finite(paths$b) & paths$b != 0
-  paths_use <- paths[keep, , drop = FALSE]
-  if (nrow(paths_use) == 0L) return(data.frame())
-  rows <- list()
-  ii <- 0L
-  for (path in as.character(paths_use$key_path)) {
-    keys <- strsplit(path, " -> ", fixed = TRUE)[[1L]]
-    if (length(keys) < 2L) next
-    for (j in seq_len(length(keys) - 1L)) {
-      ii <- ii + 1L
-      rows[[ii]] <- data.frame(
-        from_key = keys[j],
-        to_key = keys[j + 1L],
-        stage = j + 1L,
-        stringsAsFactors = FALSE
-      )
+# -----------------------------------------------------------------------------
+# Post-selection causal effect stage (sequential)
+#
+# For the fixed set of significant paths, every mediator on those paths gets a
+# linear mediator model conditional on X, C, its parents and all upstream
+# ancestors on the effect paths; the outcome model conditions on X, C and every
+# mediator in the set. NDE / NIE / TE then follow by g-computation, propagating
+# the exposure through the mediator models layer by layer. Survival effects
+# are on the Cox linear-predictor (log hazard ratio) scale.
+# -----------------------------------------------------------------------------
+
+zentangler_sequential_effect_paths <- function(paths, q_threshold = 0.25) {
+  if (is.null(paths) || nrow(paths) == 0L) return(data.frame(key_path = character(0), stringsAsFactors = FALSE))
+  keep <- is.finite(paths$q_primary) & paths$q_primary <= q_threshold & is.finite(paths$b) & paths$b != 0
+  paths[keep, , drop = FALSE]
+}
+
+zentangler_sequential_key_structure <- function(paths) {
+  keys_list <- strsplit(as.character(paths$key_path), " -> ", fixed = TRUE)
+  stage <- list()
+  parents <- list()
+  ancestors <- list()
+  for (keys in keys_list) {
+    for (j in seq_along(keys)) {
+      k <- keys[[j]]
+      stage[[k]] <- j
+      if (j > 1L) {
+        parents[[k]] <- unique(c(parents[[k]], keys[[j - 1L]]))
+        ancestors[[k]] <- unique(c(ancestors[[k]], keys[seq_len(j - 1L)]))
+      }
     }
   }
-  if (length(rows) == 0L) return(data.frame())
-  out <- unique(do.call(rbind, rows))
-  rownames(out) <- NULL
-  out
+  list(stage = unlist(stage), parents = parents, ancestors = ancestors)
 }
 
 zentangler_fit_sequential_mediator_models <- function(paths, data_by_key, X, C = NULL) {
-  active_keys <- zentangler_sequential_active_keys(paths)
-  if (length(active_keys) == 0L) return(list(models = list(), active_keys = character(0), edge_table = data.frame()))
-  edge_table <- zentangler_sequential_edge_table(paths)
-  keys_by_stage <- split(c(edge_table$from_key[edge_table$stage == 2L], edge_table$to_key), c(rep(1L, sum(edge_table$stage == 2L)), edge_table$stage))
-  if (length(edge_table) == 0L) {
-    keys_by_stage <- list(active_keys)
-    names(keys_by_stage) <- "1"
-  } else {
-    first_keys <- unique(edge_table$from_key[edge_table$stage == 2L])
-    keys_by_stage <- split(edge_table$to_key, edge_table$stage)
-    keys_by_stage <- c(list(`1` = first_keys), keys_by_stage)
-    keys_by_stage <- lapply(keys_by_stage, unique)
-  }
-  keys_by_stage <- keys_by_stage[order(as.integer(names(keys_by_stage)))]
+  ks <- zentangler_sequential_key_structure(paths)
+  keys <- names(sort(ks$stage))
   models <- list()
-  for (stage_name in names(keys_by_stage)) {
-    stage <- as.integer(stage_name)
-    for (key in keys_by_stage[[stage_name]]) {
-      y <- as.numeric(data_by_key[[key]])
-      if (stage <= 1L) {
-        dat <- data.frame(y = y, X = as.numeric(X), check.names = FALSE)
-        if (!is.null(C) && ncol(C) > 0L) dat <- cbind(dat, as.data.frame(C, check.names = FALSE))
-      } else {
-        parent_keys <- unique(edge_table$from_key[edge_table$to_key == key])
-        parent_df <- as.data.frame(lapply(parent_keys, function(pk) as.numeric(data_by_key[[pk]])), check.names = FALSE)
-        colnames(parent_df) <- parent_keys
-        dat <- data.frame(y = y, X = as.numeric(X), check.names = FALSE)
-        if (ncol(parent_df) > 0L) dat <- cbind(dat, parent_df)
-        if (!is.null(C) && ncol(C) > 0L) dat <- cbind(dat, as.data.frame(C, check.names = FALSE))
-      }
-      fit <- try(stats::lm(y ~ ., data = dat), silent = TRUE)
-      if (inherits(fit, "try-error")) next
-      co <- stats::coef(fit)
-      co[!is.finite(co)] <- 0
-      models[[key]] <- list(stage = stage, parents = if (stage <= 1L) character(0) else parent_keys, coefficients = co)
+  for (key in keys) {
+    regs <- ks$ancestors[[key]] %||% character(0)
+    D <- cbind(`(Intercept)` = 1, X = as.numeric(X))
+    if (!is.null(C) && ncol(C) > 0L) D <- cbind(D, as.matrix(C))
+    if (length(regs) > 0L) {
+      R <- do.call(cbind, lapply(regs, function(k) as.numeric(data_by_key[[k]])))
+      colnames(R) <- regs
+      D <- cbind(D, R)
     }
+    fit <- stats::lm.fit(D, as.numeric(data_by_key[[key]]))
+    co <- fit$coefficients
+    names(co) <- colnames(D)
+    if (any(!is.finite(co))) stop("Sequential mediator model for ", key, " is rank deficient.", call. = FALSE)
+    models[[key]] <- list(stage = ks$stage[[key]], regressors = regs, coefficients = co)
   }
-  list(models = models, active_keys = active_keys, edge_table = edge_table)
+  list(models = models, keys = keys)
 }
 
-zentangler_predict_sequential_mediators <- function(model_info, X_value, X_obs, data_by_key, C = NULL) {
-  models <- model_info$models %||% list()
-  if (length(models) == 0L) return(matrix(nrow = length(X_obs), ncol = 0))
-  order_keys <- names(sort(vapply(models, function(x) x$stage %||% 1L, integer(1))))
-  out <- matrix(NA_real_, nrow = length(X_obs), ncol = length(order_keys))
-  colnames(out) <- order_keys
-  for (key in order_keys) {
-    info <- models[[key]]
-    co <- info$coefficients
-    val <- rep(co[["(Intercept)"]] %||% 0, length(X_obs))
-    if ("X" %in% names(co)) val <- val + co[["X"]] * as.numeric(X_value)
-    if (length(info$parents) > 0L) {
-      for (pk in info$parents) {
-        coef_pk <- if (pk %in% names(co)) as.numeric(co[[pk]]) else 0
-        if (pk %in% colnames(out)) {
-          val <- val + coef_pk * out[, pk]
-        } else {
-          val <- val + coef_pk * as.numeric(data_by_key[[pk]])
-        }
-      }
-    }
-    if (!is.null(C) && ncol(C) > 0L) {
-      for (cn in colnames(C)) {
-        if (cn %in% names(co)) val <- val + co[[cn]] * as.numeric(C[, cn])
-      }
-    }
+zentangler_predict_sequential_mediators <- function(model_info, X_value, n, C = NULL) {
+  keys <- model_info$keys
+  out <- matrix(NA_real_, nrow = n, ncol = length(keys), dimnames = list(NULL, keys))
+  for (key in keys) {
+    m <- model_info$models[[key]]
+    co <- m$coefficients
+    val <- rep(co[["(Intercept)"]], n) + co[["X"]] * as.numeric(X_value)
+    if (!is.null(C) && ncol(C) > 0L) val <- val + as.numeric(as.matrix(C) %*% co[colnames(C)])
+    for (r in m$regressors) val <- val + co[[r]] * out[, r]
     out[, key] <- val
   }
   out
@@ -463,94 +419,96 @@ compute_effect_decomposition_sequential <- function(
   data_by_key,
   C = NULL,
   y_family = c("gaussian", "binomial", "survival"),
-  x0 = NULL,
-  x1 = NULL
+  x0,
+  x1,
+  n_layers = 2L
 ) {
   y_family <- match.arg(y_family)
-  contrast <- infer_effect_contrast(X, x0 = x0, x1 = x1)
-  x0 <- contrast[["x0"]]
-  x1 <- contrast[["x1"]]
-  delta_x <- contrast[["delta"]]
-  active_keys <- zentangler_sequential_active_keys(sequential_paths)
-  if (length(active_keys) == 0L) {
-    reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
-    reduced_te <- reduced_summary$reduced_total_effect[[1L]]
-    return(data.frame(
-      effect_method = if (identical(y_family, "binomial")) "parametric_g_computation_logistic_sequential" else if (identical(y_family, "survival")) "cox_log_hazard_product_summary_sequential" else "parametric_g_computation_linear_sequential",
-      effect_scale = if (identical(y_family, "binomial")) "risk_difference" else if (identical(y_family, "survival")) "log_hazard_ratio" else "mean_difference",
-      x0 = x0, x1 = x1, delta_x = delta_x,
-      nde = reduced_te, nie_total = 0, te = reduced_te,
-      prop_mediated = 0, reduced_total_effect = reduced_te,
-      reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
-      p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
-      decomposition_gap = 0, direct_effect = reduced_te, indirect_total = 0,
-      total_decomp = reduced_te, n_active_paths = 0L, n_active_mediators = 0L,
-      n_active_edges = 0L, indirect_product_sum = 0,
-      stringsAsFactors = FALSE
-    ))
+  contrast <- c(x0 = as.numeric(x0), x1 = as.numeric(x1), delta = as.numeric(x1) - as.numeric(x0))
+  n <- length(as.numeric(X))
+  lab <- zentangler_effect_labels(y_family, sequential = TRUE)
+  reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
+  stage_names <- paste0("stage", seq_len(n_layers))
+  na_row <- function(n_paths, n_keys) {
+    out <- zentangler_na_effect_row(y_family, contrast, reduced_summary, n_keys, sequential = TRUE)
+    out$n_active_paths <- n_paths
+    out$n_active_mediators <- n_keys
+    for (st in stage_names) out[[paste0("nie_", st)]] <- NA_real_
+    out
   }
-  model_info <- zentangler_fit_sequential_mediator_models(sequential_paths, data_by_key = data_by_key, X = X, C = C)
-  M_obs <- as.matrix(as.data.frame(lapply(active_keys, function(k) as.numeric(data_by_key[[k]])), check.names = FALSE))
-  colnames(M_obs) <- active_keys
-  effect_fit <- fit_active_outcome_effect_model(Y = Y, X = X, M_active = M_obs, C = C, y_family = y_family)
+
+  has_paths <- !is.null(sequential_paths) && nrow(sequential_paths) > 0L
+  if (has_paths) {
+    model_info <- try(zentangler_fit_sequential_mediator_models(sequential_paths, data_by_key, X, C), silent = TRUE)
+    if (inherits(model_info, "try-error")) {
+      warning("Sequential mediator models failed; causal effects are NA.", call. = FALSE)
+      return(na_row(nrow(sequential_paths), NA_integer_))
+    }
+    keys <- model_info$keys
+    M_obs <- do.call(cbind, lapply(keys, function(k) as.numeric(data_by_key[[k]])))
+    colnames(M_obs) <- keys
+  } else {
+    model_info <- list(models = list(), keys = character(0))
+    keys <- character(0)
+    M_obs <- matrix(nrow = n, ncol = 0)
+  }
+  design_names <- if (length(keys) > 0L) make.names(paste0("M_", keys), unique = TRUE) else character(0)
+  M_named <- M_obs
+  colnames(M_named) <- design_names
+  effect_fit <- fit_active_outcome_effect_model(Y = Y, X = X, M_active = M_named, C = C, y_family = y_family)
+  if (is.null(effect_fit$coefficients)) return(na_row(if (has_paths) nrow(sequential_paths) else 0L, length(keys)))
   co <- effect_fit$coefficients
   Z_template <- effect_fit$design
-  reduced_summary <- estimate_reduced_x_summary(Y = Y, X = X, C = C, y_family = y_family, x0 = x0, x1 = x1)
-  if (identical(y_family, "survival")) {
-    reduced_te <- reduced_summary$reduced_total_effect[[1L]]
-    path_scores <- sequential_paths$sequential_score[is.finite(sequential_paths$sequential_score) & is.finite(sequential_paths$b) & sequential_paths$b != 0]
-    indirect_linear_product <- sum(path_scores, na.rm = TRUE) * delta_x
-    direct_linear_product <- if ("X" %in% names(co)) as.numeric(co[["X"]]) * delta_x else reduced_te - indirect_linear_product
-    return(data.frame(
-      effect_method = "cox_log_hazard_product_summary_sequential",
-      effect_scale = "log_hazard_ratio",
-      x0 = x0, x1 = x1, delta_x = delta_x,
-      nde = direct_linear_product, nie_total = indirect_linear_product, te = direct_linear_product + indirect_linear_product,
-      prop_mediated = if (is.finite(reduced_te) && abs(reduced_te) > 1e-08) indirect_linear_product / reduced_te else NA_real_,
-      reduced_total_effect = reduced_te,
-      reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
-      p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
-      decomposition_gap = NA_real_,
-      direct_effect = direct_linear_product, indirect_total = indirect_linear_product, total_decomp = direct_linear_product + indirect_linear_product,
-      n_active_paths = nrow(sequential_paths), n_active_mediators = length(active_keys), n_active_edges = nrow(model_info$edge_table),
-      indirect_product_sum = indirect_linear_product,
-      stringsAsFactors = FALSE
-    ))
+
+  rename <- function(M) {
+    colnames(M) <- design_names
+    M
   }
-  M_x0 <- zentangler_predict_sequential_mediators(model_info, X_value = x0, X_obs = X, data_by_key = data_by_key, C = C)
-  M_x1 <- zentangler_predict_sequential_mediators(model_info, X_value = x1, X_obs = X, data_by_key = data_by_key, C = C)
+  M_x0 <- rename(zentangler_predict_sequential_mediators(model_info, x0, n, C))
+  M_x1 <- rename(zentangler_predict_sequential_mediators(model_info, x1, n, C))
+  # Natural-course mediators under x0/x1 are model predictions; keep the
+  # observed residual so the g-computation is centred on the observed data.
+  if (length(keys) > 0L) {
+    M_fit_obs <- rename(zentangler_predict_sequential_mediators(model_info, as.numeric(X), n, C))
+    resid <- M_named - M_fit_obs
+    M_x0 <- M_x0 + resid
+    M_x1 <- M_x1 + resid
+  }
   mu_00 <- predict_effect_mean(co, Z_template, X_value = x0, M_value = M_x0, y_family = y_family)
   mu_10 <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_x0, y_family = y_family)
   mu_11 <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_x1, y_family = y_family)
-  nde <- mean(mu_10 - mu_00, na.rm = TRUE)
-  nie <- mean(mu_11 - mu_10, na.rm = TRUE)
-  te <- mean(mu_11 - mu_00, na.rm = TRUE)
-  reduced_te <- reduced_summary$reduced_total_effect[[1L]]
-  stage_counts <- table(vapply(model_info$models, function(x) x$stage %||% 1L, integer(1)))
+  nde <- mean(mu_10 - mu_00)
+  nie <- mean(mu_11 - mu_10)
+  te <- nde + nie
+
   out <- data.frame(
-    effect_method = if (identical(y_family, "binomial")) "parametric_g_computation_logistic_sequential" else "parametric_g_computation_linear_sequential",
-    effect_scale = if (identical(y_family, "binomial")) "risk_difference" else "mean_difference",
-    x0 = x0, x1 = x1, delta_x = delta_x,
+    effect_method = lab$method,
+    effect_scale = lab$scale,
+    x0 = x0, x1 = x1, delta_x = contrast[["delta"]],
     nde = nde, nie_total = nie, te = te,
     prop_mediated = if (is.finite(te) && abs(te) > 1e-08) nie / te else NA_real_,
-    reduced_total_effect = reduced_te,
+    reduced_total_effect = reduced_summary$reduced_total_effect[[1L]],
     reduced_total_effect_coefficient = reduced_summary$reduced_total_effect_coefficient[[1L]],
     p_reduced_total_effect = reduced_summary$p_reduced_total_effect[[1L]],
-    decomposition_gap = te - (nde + nie),
-    direct_effect = nde, indirect_total = nie, total_decomp = te,
-    n_active_paths = nrow(sequential_paths), n_active_mediators = length(active_keys), n_active_edges = nrow(model_info$edge_table),
-    indirect_product_sum = sum(sequential_paths$sequential_score[is.finite(sequential_paths$sequential_score) & is.finite(sequential_paths$b) & sequential_paths$b != 0], na.rm = TRUE) * delta_x,
+    direct_coefficient_active_model = as.numeric(co[["X"]]),
+    n_active_total = length(keys),
+    n_active_paths = if (has_paths) nrow(sequential_paths) else 0L,
+    n_active_mediators = length(keys),
+    indirect_product_sum = if (has_paths) sum(sequential_paths$sequential_score, na.rm = TRUE) * contrast[["delta"]] else 0,
     stringsAsFactors = FALSE
   )
-  for (st in names(stage_counts)) {
-    keys_st <- names(which(vapply(model_info$models, function(x) identical(as.integer(x$stage %||% 1L), as.integer(st)), logical(1))))
-    M_stage <- M_x0
-    hit <- intersect(keys_st, colnames(M_stage))
-    if (length(hit) > 0L) M_stage[, hit] <- M_x1[, hit, drop = FALSE]
-    mu_stage <- predict_effect_mean(co, Z_template, X_value = x1, M_value = M_stage, y_family = y_family)
-    safe <- paste0("stage", st)
-    out[[paste0("nie_", safe)]] <- mean(mu_stage - mu_10, na.rm = TRUE)
-    out[[paste0("n_active_", safe)]] <- as.integer(stage_counts[[st]])
+  stage_of <- if (length(keys) > 0L) model_info$models[keys] else list()
+  for (st in seq_len(n_layers)) {
+    nm <- paste0("nie_stage", st)
+    cols <- design_names[vapply(stage_of, function(m) identical(as.integer(m$stage), st), logical(1))]
+    if (length(cols) == 0L) {
+      out[[nm]] <- 0
+    } else {
+      # Shift only stage-st mediators to their x1 values (holding the rest at x0).
+      M_st <- M_x0
+      M_st[, cols] <- M_x1[, cols, drop = FALSE]
+      out[[nm]] <- mean(predict_effect_mean(co, Z_template, X_value = x1, M_value = M_st, y_family = y_family) - mu_10)
+    }
   }
   out
 }
